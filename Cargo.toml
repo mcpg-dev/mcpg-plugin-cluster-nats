@@ -1,0 +1,46 @@
+[package]
+name = "mcpg-plugin-cluster-nats"
+version = "0.1.0-alpha.15"
+license = "BUSL-1.1"
+edition = "2024"
+description = "NATS JetStream cluster_backend plugin (dev.mcpg.cluster.nats)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+
+# async-nats version pinned to match plugins/bindings/nats —
+# same workspace dep, one cargo build.
+async-nats = "0.47"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["nats", "blocking"] }
+
+[features]
+default = ["cdylib-export"]
+cdylib-export = []
+integration-tests = []
+# Declared so the SDK's `declare_plugin!` `register_static` function
+# (gated `#[cfg(feature = "static-firstparty")]`) does not trigger
+# `unexpected_cfgs` in consumer compilation. Empty: `cluster_backend`
+# has no static-firstparty path today — the `__mcpg_dispatch_register_static!`
+# arm for it emits `compile_error!` — so enabling this feature is
+# intentionally unsupported on cluster plugins until
+# `FirstPartyRegistrar::register_cluster_backend_with_alias` is added.
+static-firstparty = []

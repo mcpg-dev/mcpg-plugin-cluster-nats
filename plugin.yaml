@@ -1,0 +1,23 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.cluster.nats
+name: NATS JetStream Cluster Coordinator
+license: BUSL-1.1
+description: |
+  Multi-node `cluster` coordinator backed by NATS JetStream. Uses
+  JS KV buckets for leases and locks (with CAS for fencing-token
+  monotonicity), NATS subjects for peer presence + heartbeats,
+  and JetStream consumers for pub/sub.
+
+  Exercises the streaming FFI surface (subscribe / watch_peers)
+  and the lease-handle trait-object across FFI together against
+  a real backend.
+class: cluster
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities:
+  # Raw-TCP egress to NATS — JetStream uses the same port (4222 by
+  # default) as core NATS, so this is plain TCP, not HTTPS.
+  - network_outbound
+provides:
+  - kv
+  - bus
