@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_nats::jetstream::kv::Store as KvStore;
+use async_nats::jetstream::kv::{Operation, Store as KvStore};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -20,8 +20,8 @@ pub struct NatsKv {
 impl NatsKv {
     /// Construct a `NatsKv` over an already-bootstrapped JS KV store.
     /// Used by `mcpg-plugin-cluster-nats` to share its single
-    /// connection across the coordinator + the four primitive
-    /// accessors instead of opening a fresh connection per primitive.
+    /// connection across the coordinator + the primitive accessors
+    /// instead of opening a fresh connection per primitive.
     pub fn with_store(store: KvStore) -> Self {
         Self { store }
     }
@@ -83,7 +83,7 @@ fn decode_key(encoded: &str) -> Option<String> {
 ///
 /// JetStream KV has no native per-key TTL — only a bucket-wide
 /// `max_age`. To honor the [`KeyValueStore`] per-key TTL contract (the
-/// one consul/etcd/redis satisfy natively), a value written with a TTL
+/// one redis satisfies natively), a value written with a TTL
 /// is stored as `MAGIC ‖ u64-BE(expires_at_secs) ‖ value`, and the
 /// expiry is decoded and enforced on read. Values without a TTL are
 /// stored verbatim, so the common path stays byte-identical and is
@@ -139,6 +139,20 @@ fn decode_value(stored: Bytes) -> (Bytes, Option<u64>) {
 /// True when an inline expiry has elapsed (logically absent).
 fn is_expired(expires_at_secs: Option<u64>) -> bool {
     expires_at_secs.is_some_and(|s| s <= now_unix_secs())
+}
+
+/// Pause between lost CAS rounds: linear growth plus sub-millisecond
+/// clock-derived decorrelation, so contenders that collided in one
+/// round don't re-collide in lock-step on the next.
+async fn cas_backoff(attempt: u32) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    tokio::time::sleep(Duration::from_micros(
+        u64::from(attempt) * 500 + nanos % 700,
+    ))
+    .await;
 }
 
 #[async_trait]
@@ -307,6 +321,79 @@ impl KeyValueStore for NatsKv {
                 reason: format!("nats kv expire put `{key}`: {e}"),
             })?;
         Ok(true)
+    }
+
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        // Atomicity rides the bucket's per-key revision: read the entry,
+        // compute the new count, then `create` (absent / tombstoned) or
+        // `update` at the observed revision — both atomic single-winner
+        // ops. A lost race backs off (each round only one contender can
+        // win, so N-way storms need up to N rounds) and retries. The
+        // counter value rides the same inline-TTL envelope as every
+        // other value in this bucket, so `get` / `list_prefix`
+        // round-trip it unchanged.
+        const CAS_ATTEMPTS: u32 = 64;
+        let encoded = encode_key(key);
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                cas_backoff(attempt).await;
+            }
+            let entry =
+                self.store
+                    .entry(&encoded)
+                    .await
+                    .map_err(|e| ClusterError::BackendUnavailable {
+                        reason: format!("nats kv incr entry `{key}`: {e}"),
+                    })?;
+            let live = entry
+                .as_ref()
+                .filter(|e| e.operation != Operation::Delete && e.operation != Operation::Purge);
+            match live {
+                None => {
+                    let payload = encode_value(delta.to_string().as_bytes(), expires_at_from(ttl));
+                    // Atomic create — loses only to a concurrent writer.
+                    if self.store.create(&encoded, payload).await.is_ok() {
+                        return Ok(delta);
+                    }
+                }
+                Some(e) => {
+                    let (bytes, expires_at_secs) = decode_value(e.value.clone());
+                    let expired = is_expired(expires_at_secs);
+                    let current = if expired {
+                        0
+                    } else {
+                        mcpg_cluster_api::parse_counter(&bytes)?
+                    };
+                    let next = current
+                        .checked_add(delta)
+                        .ok_or_else(mcpg_cluster_api::counter_overflow)?;
+                    let expires = match ttl {
+                        Some(_) => expires_at_from(ttl),
+                        // ttl=None leaves a live entry's expiry untouched.
+                        None if !expired => expires_at_secs,
+                        None => None,
+                    };
+                    let payload = encode_value(next.to_string().as_bytes(), expires);
+                    if self
+                        .store
+                        .update(&encoded, payload, e.revision)
+                        .await
+                        .is_ok()
+                    {
+                        return Ok(next);
+                    }
+                }
+            }
+        }
+        Err(ClusterError::CasConflict {
+            key: key.to_owned(),
+            reason: format!("nats kv incr: revision CAS lost {CAS_ATTEMPTS} rounds"),
+        })
     }
 }
 

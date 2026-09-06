@@ -5,17 +5,12 @@
 //! by the cluster plugin.
 //!
 //! Implements:
-//! - [`NatsKv`] — `KeyValueStore` over a JetStream KV bucket
-//! - [`NatsLock`] — `Lease` via JS KV CAS with monotonic fence tokens
+//! - [`NatsKv`] — `KeyValueStore` over a JetStream KV bucket, with
+//!   a revision-CAS-loop atomic `incr`
 //! - [`NatsTopicBus`] — `PubSub` over Core NATS subjects
-//! - [`NatsWatch`] — `Watch` over JS KV's native `watch_all` stream
 
 mod kv;
-mod lock;
 mod topic;
-mod watch;
 
 pub use kv::NatsKv;
-pub use lock::NatsLock;
 pub use topic::NatsTopicBus;
-pub use watch::NatsWatch;

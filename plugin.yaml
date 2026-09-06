@@ -6,7 +6,21 @@ description: |
   Multi-node `cluster` coordinator backed by NATS JetStream. Uses
   JS KV buckets for leases and locks (with CAS for fencing-token
   monotonicity), NATS subjects for peer presence + heartbeats,
-  and JetStream consumers for pub/sub.
+  and Core NATS subscriptions for pub/sub — a subscribe queue
+  group maps to a NATS queue subscription, so group members
+  across replicas load-balance for real (each message reaches
+  exactly one member). No payload cap worth declaring (server
+  default 1 MiB).
+
+  Auth (`auth.method`): `token`, `user_password`, `credentials_file`
+  (path to a `.creds` file), or `credentials` — the full
+  credentials-file content inline in `auth.creds` (user-JWT + nkey-seed
+  sections), typically injected as `${env.X}` via the gateway's
+  config-load substitution so per-tenant NATS accounts need no mounted
+  file. The blob is shape-checked at config load and never logged.
+  TLS is required by default; `tls.ca_cert` trusts a private-CA root
+  given either as a filesystem path or as inline PEM (a value starting
+  with `-----BEGIN`), matching the redis coordinator convention.
 
   Exercises the streaming FFI surface (subscribe / watch_peers)
   and the lease-handle trait-object across FFI together against

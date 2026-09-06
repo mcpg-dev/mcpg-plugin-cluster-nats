@@ -19,7 +19,8 @@ pub struct ClusterNatsConfig {
     /// Optional TLS knobs. TLS is REQUIRED BY DEFAULT (secure-by-default):
     /// with this block omitted the connection still demands TLS. To run
     /// plaintext NATS (local/dev), set `tls: { require_tls: false }`
-    /// explicitly. `ca_cert` adds a custom root for a private CA.
+    /// explicitly. `ca_cert` trusts a private-CA root (inline PEM or a
+    /// file path).
     #[serde(default)]
     pub tls: Option<TlsConfig>,
 
@@ -39,7 +40,7 @@ pub struct ClusterNatsConfig {
     pub connection: ConnectionConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AuthConfig {
     /// Static token.
@@ -48,13 +49,51 @@ pub enum AuthConfig {
     UserPassword { user: String, password: String },
     /// `.creds` file path. async-nats reads it on connect.
     CredentialsFile { path: String },
+    /// Inline NATS credentials: the full `.creds` file CONTENT (the
+    /// user-JWT and nkey-seed sections), typically injected as
+    /// `${env.VAR}` via the gateway's config-load substitution so no
+    /// credentials file has to be mounted. Shape-checked at config
+    /// load; the value itself is never logged.
+    Credentials { creds: String },
+}
+
+/// Section markers a standard NATS credentials file carries. The early
+/// shape check on inline `auth.creds` pivots on them.
+const CREDS_JWT_MARKER: &str = "-----BEGIN NATS USER JWT-----";
+const CREDS_SEED_MARKER: &str = "-----BEGIN USER NKEY SEED-----";
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual impl so credential material (token, password, creds
+        // blob) is never rendered into a log line / panic message.
+        // Non-secret selector fields stay visible.
+        match self {
+            Self::Token { .. } => f.debug_struct("Token").field("token", &"***").finish(),
+            Self::UserPassword { user, .. } => f
+                .debug_struct("UserPassword")
+                .field("user", user)
+                .field("password", &"***")
+                .finish(),
+            Self::CredentialsFile { path } => f
+                .debug_struct("CredentialsFile")
+                .field("path", path)
+                .finish(),
+            Self::Credentials { .. } => f
+                .debug_struct("Credentials")
+                .field("creds", &"***")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
-    /// Extra PEM root certificate for a private CA. When set, it is
-    /// added to the trust roots; server-cert verification stays on.
+    /// Private-CA root certificate (PEM, inline or path), matching the
+    /// redis coordinator convention: a value starting with
+    /// `-----BEGIN` is inline PEM content, anything else is a
+    /// filesystem path. When set it becomes the trust root in place of
+    /// the system roots; server-cert verification stays on.
     #[serde(default)]
     pub ca_cert: Option<String>,
     /// Whether TLS is required for the connection (maps to async-nats
@@ -206,6 +245,12 @@ impl Default for ConnectionConfig {
     }
 }
 
+/// Detect whether a PEM-ish config value is inline content rather than
+/// a filesystem path, matching the redis coordinator convention.
+pub(crate) fn is_inline_pem(value: &str) -> bool {
+    value.trim_start().starts_with("-----BEGIN")
+}
+
 fn default_require_tls() -> bool {
     true
 }
@@ -279,6 +324,22 @@ impl ClusterNatsConfig {
                 return Err(ConfigError::Invalid(format!(
                     "`servers` URL must use scheme nats:// / tls:// / nats+tls:// / ws:// / wss:// — got `{trimmed}`"
                 )));
+            }
+        }
+        if let Some(AuthConfig::Credentials { creds }) = &self.auth {
+            // Shape check only — async-nats parses the JWT + seed for
+            // real when the connect options are built. Failing here
+            // turns a half-pasted value / wrong env var into a
+            // config-load error instead of a connect-time one. The
+            // message never echoes the value: it is a credential.
+            for marker in [CREDS_JWT_MARKER, CREDS_SEED_MARKER] {
+                if !creds.contains(marker) {
+                    return Err(ConfigError::Invalid(format!(
+                        "`auth.creds` must be the full NATS credentials-file content, but its \
+                         `{marker}` section is missing (value not echoed — check the env var / \
+                         secret it was substituted from)"
+                    )));
+                }
             }
         }
         let node_id = self.node.id.trim();
@@ -522,6 +583,137 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(cfg.auth, Some(AuthConfig::CredentialsFile { .. })));
+    }
+
+    /// A syntactically complete NATS credentials-file blob. The seed is
+    /// the throwaway one async-nats' own tests use.
+    fn creds_blob() -> String {
+        [
+            "-----BEGIN NATS USER JWT-----",
+            "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.eyJzdWIiOiJVQUJDIn0.c2ln",
+            "------END NATS USER JWT------",
+            "",
+            "-----BEGIN USER NKEY SEED-----",
+            "SUACH75SWCM5D2JMJM6EKLR2WDARVGZT4QC6LX3AGHSWOMVAKERABBBRWM",
+            "------END USER NKEY SEED------",
+            "",
+        ]
+        .join("\n")
+    }
+
+    fn parse_with_creds(creds: &str) -> Result<ClusterNatsConfig, ConfigError> {
+        ClusterNatsConfig::parse(
+            &serde_json::json!({
+                "servers": ["tls://nats:4222"],
+                "node": {"id": "g1"},
+                "auth": {"method": "credentials", "creds": creds}
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn inline_credentials_auth_parses() {
+        let cfg = parse_with_creds(&creds_blob()).unwrap();
+        match cfg.auth {
+            Some(AuthConfig::Credentials { ref creds }) => assert_eq!(*creds, creds_blob()),
+            other => panic!("expected inline credentials auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_credentials_missing_jwt_section_rejected() {
+        let no_jwt = creds_blob().replace("NATS USER JWT", "SOMETHING ELSE");
+        let err = parse_with_creds(&no_jwt).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auth.creds"), "{msg}");
+        assert!(msg.contains("-----BEGIN NATS USER JWT-----"), "{msg}");
+    }
+
+    #[test]
+    fn inline_credentials_missing_seed_section_rejected() {
+        // Half-pasted value: JWT block only.
+        let jwt_only =
+            "-----BEGIN NATS USER JWT-----\neyJhIjoiYiJ9\n------END NATS USER JWT------\n";
+        let err = parse_with_creds(jwt_only).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auth.creds"), "{msg}");
+        assert!(msg.contains("-----BEGIN USER NKEY SEED-----"), "{msg}");
+        // The credential itself must never appear in the error.
+        assert!(
+            !msg.contains("eyJhIjoiYiJ9"),
+            "creds echoed in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn inline_credentials_empty_value_rejected() {
+        // An unset env var substitutes to an empty string — the shape
+        // check must catch it rather than deferring to connect time.
+        assert!(parse_with_creds("").is_err());
+    }
+
+    #[test]
+    fn auth_debug_never_renders_secret_material() {
+        let dbg = format!("{:?}", parse_with_creds(&creds_blob()).unwrap());
+        assert!(!dbg.contains("SUACH75"), "seed leaked in Debug: {dbg}");
+        assert!(!dbg.contains("eyJ0eXAi"), "jwt leaked in Debug: {dbg}");
+
+        let cfg = ClusterNatsConfig::parse(
+            r#"{
+                "servers": ["nats://x"],
+                "node": {"id": "g"},
+                "auth": {"method": "token", "token": "hunter2"}
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            !format!("{cfg:?}").contains("hunter2"),
+            "token leaked in Debug"
+        );
+
+        let cfg = ClusterNatsConfig::parse(
+            r#"{
+                "servers": ["nats://x"],
+                "node": {"id": "g"},
+                "auth": {"method": "user_password", "user": "svc", "password": "hunter2"}
+            }"#,
+        )
+        .unwrap();
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("hunter2"), "password leaked in Debug: {dbg}");
+        assert!(
+            dbg.contains("svc"),
+            "non-secret user hidden in Debug: {dbg}"
+        );
+    }
+
+    #[test]
+    fn inline_pem_detection_both_ways() {
+        assert!(is_inline_pem("-----BEGIN CERTIFICATE-----\nMIIB\n"));
+        // Leading whitespace (a YAML block scalar keeps its newline).
+        assert!(is_inline_pem("\n-----BEGIN CERTIFICATE-----\nMIIB\n"));
+        assert!(!is_inline_pem("/etc/mcpg/certs/nats-ca.pem"));
+        assert!(!is_inline_pem("relative/ca.pem"));
+    }
+
+    #[test]
+    fn tls_ca_cert_accepts_inline_pem_and_path_verbatim() {
+        for value in [
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+            "/etc/mcpg/certs/nats-ca.pem",
+        ] {
+            let cfg = ClusterNatsConfig::parse(
+                &serde_json::json!({
+                    "servers": ["tls://nats:4222"],
+                    "node": {"id": "g1"},
+                    "tls": {"ca_cert": value}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(cfg.tls.unwrap().ca_cert.as_deref(), Some(value));
+        }
     }
 
     #[test]

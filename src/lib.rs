@@ -38,14 +38,14 @@ use tokio::sync::OnceCell;
 
 use mcpg_cluster_api::{
     BoxActiveLease, BoxPeerEventStream, BoxPublishedMessageStream, ClusterBackend, ClusterError,
-    ClusterNodeInfo, ClusterPeer, KeyValueStore, Lease, PeerHealth, PubSub, Watch,
+    ClusterNodeInfo, ClusterPeer, KeyValueStore, PeerHealth, PubSub,
 };
 use mcpg_plugin_protocol::async_trait;
 use mcpg_plugin_protocol::{PluginClass, PluginManifest};
 use mcpg_plugin_sdk::declare_plugin;
 use mcpg_plugin_sdk::ffi::{SyncClusterBackend, WatchHandleBox};
 
-use crate::state::{NatsKv, NatsLock, NatsTopicBus, NatsWatch};
+use crate::state::{NatsKv, NatsTopicBus};
 
 pub use lease::NatsJetStreamLeaseHandle;
 
@@ -115,12 +115,7 @@ struct Connected {
 /// from each accessor call.
 struct NatsPrimitives {
     kv: Arc<NatsKv>,
-    lease: Arc<NatsLock>,
     pub_sub: Arc<NatsTopicBus>,
-    /// JS KV native change-notification stream over the same
-    /// `state_bucket` `kv` writes into. `watch_all` per subscriber;
-    /// prefix filter applied client-side.
-    watch: Arc<NatsWatch>,
 }
 
 impl NatsJetStreamCoordinator {
@@ -266,16 +261,10 @@ async fn get_or_init_connected(
 
             // Build the primitive bundle off the same connection the
             // coordinator holds. The `KeyValueStore` primitive points at
-            // `state_bucket`; `Lease` reuses the KV-via-`with_store`
-            // constructor on the dedicated leases bucket; `PubSub` shares the
-            // connected `Client`. `Watch` runs over the same `state_bucket`
-            // so put/delete events from the coordinator's `KeyValueStore`
-            // accessor surface to subscribers.
+            // `state_bucket`; `PubSub` shares the connected `Client`.
             let primitives = NatsPrimitives {
                 kv: Arc::new(NatsKv::with_store(client.state.clone())),
-                lease: Arc::new(NatsLock::with_store(client.leases.clone())),
                 pub_sub: Arc::new(NatsTopicBus::with_client(client.nats.clone())),
-                watch: Arc::new(NatsWatch::with_store(client.state.clone())),
             };
 
             Ok::<Connected, ClusterError>(Connected {
@@ -326,20 +315,6 @@ impl ClusterBackend for NatsJetStreamCoordinator {
             .connected
             .get()
             .map(|c| Arc::clone(&c.primitives.pub_sub) as Arc<dyn PubSub>)
-    }
-
-    fn lease(&self) -> Option<Arc<dyn Lease>> {
-        self.inner
-            .connected
-            .get()
-            .map(|c| Arc::clone(&c.primitives.lease) as Arc<dyn Lease>)
-    }
-
-    fn watch(&self) -> Option<Arc<dyn Watch>> {
-        self.inner
-            .connected
-            .get()
-            .map(|c| Arc::clone(&c.primitives.watch) as Arc<dyn Watch>)
     }
 
     async fn node_info(&self) -> ClusterNodeInfo {
@@ -806,6 +781,13 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
             .runtime
             .block_on(async move { kv.expire(key, ttl_from_ms(ttl_ms)).await })
     }
+
+    fn kv_incr(&self, key: &str, delta: i64, ttl_ms: Option<u64>) -> Result<i64, ClusterError> {
+        let kv = Arc::clone(&self.require_connected()?.primitives.kv);
+        self.inner
+            .runtime
+            .block_on(async move { kv.incr(key, delta, ttl_from_ms(ttl_ms)).await })
+    }
 }
 
 /// Whole-millisecond TTL → `Duration` (None == no TTL).
@@ -939,7 +921,6 @@ mod tests {
         assert_eq!(manifest.id, PLUGIN_ID);
         assert!(ClusterBackend::key_value_store(&coordinator).is_none());
         assert!(ClusterBackend::pub_sub(&coordinator).is_none());
-        assert!(ClusterBackend::lease(&coordinator).is_none());
     }
 
     #[test]

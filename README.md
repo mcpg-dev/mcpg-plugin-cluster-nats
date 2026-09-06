@@ -92,9 +92,9 @@ plugins:
 | `node.address` | string | unset | Advertised address stored alongside the peer record. |
 | `node.heartbeat_interval_sec` | integer | `10` | Heartbeat publish cadence, in seconds. Must be greater than zero. |
 | `node.peer_expiry_sec` | integer | `30` | Seconds without a heartbeat before a peer is evicted and a leave event is emitted. Must exceed `node.heartbeat_interval_sec`. |
-| `auth` | tagged object | unset | Selected by `method`: `token` (`token`), `user_password` (`user`, `password`), or `credentials_file` (`path`). |
+| `auth` | tagged object | unset | Selected by `method`: `token` (`token`), `user_password` (`user`, `password`), `credentials_file` (`path`), or `credentials` (`creds` — the full `.creds` file content inline, typically `${env.X}`; validated at config load for both the user-JWT and nkey-seed sections, never logged). |
 | `tls.require_tls` | bool | `true` | TLS is required even when the whole `tls` block is omitted. |
-| `tls.ca_cert` | string | system roots | PEM root certificate for a private CA. Server-certificate verification stays on. |
+| `tls.ca_cert` | string | system roots | Private-CA root certificate: either a filesystem path or inline PEM (a value starting with `-----BEGIN`). When set it becomes the trust root in place of the system roots; server-certificate verification stays on. |
 | `jetstream.leases_bucket` | string | `mcpg-leases` | KV bucket for leases and locks. Created on first connect if missing. |
 | `jetstream.fencing_bucket` | string | `mcpg-fencing` | KV bucket for fencing-token counters. Created on first connect if missing. |
 | `jetstream.notifications_stream` | string | `mcpg-notifications` | Stream name reserved for pub/sub fan-out. Validated as non-empty; the pub/sub path itself runs over core NATS subjects. |
@@ -133,9 +133,11 @@ explicitly as a routing key is rejected.
   `cluster.allow_insecure_transport: true` is set — intended for local
   development and CI only. When TLS is negotiated the server certificate is
   always verified; there is no skip-verify knob.
-- Prefer `credentials_file` auth and keep the `.creds` file out of the config
-  artifact. A static `token` or password should come from the environment or a
-  secret provider.
+- Prefer NATS credentials auth (`credentials_file`, or `credentials` with the
+  content injected as `${env.X}` so nothing has to be mounted) and keep the
+  `.creds` material out of the config artifact. A static `token` or password
+  should come from the environment or a secret provider. The inline `creds`
+  value is redacted from `Debug` output and never logged.
 - Give each deployment sharing a NATS cluster its own bucket and stream names,
   and fence them with NATS subject permissions so deployments cannot read each
   other's coordination traffic.
@@ -177,4 +179,4 @@ revocations. See <https://mcpg.dev/docs/security/plugin-security>.
 ## See also
 - <https://mcpg.dev/docs/self-hosting/clustering> — the coordinator model, the primitive-inheritance rules, and every backend's keys.
 - <https://mcpg.dev/docs/plugins/plugins-and-protocol> — plugin classes, the ABI, and how the gateway loads them.
-- `libs/plugins/cluster/consul`, `libs/plugins/cluster/etcd`, `libs/plugins/cluster/redis` — the sibling coordinators.
+- `libs/plugins/cluster/redis` — the sibling coordinator.
