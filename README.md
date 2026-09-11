@@ -80,7 +80,7 @@ plugins:
     source:
       path: ./plugins/libmcpg_plugin_cluster_nats.so
       # or, platform-agnostic:
-      # oci: ghcr.io/mcpg-dev/source-code/plugins/cluster-nats:protocol-1
+      # oci: ghcr.io/mcpg-dev/plugins/cluster-nats
     granted_capabilities:
       - network_outbound
 ```
