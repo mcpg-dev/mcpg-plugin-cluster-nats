@@ -34,6 +34,12 @@ pub(crate) struct NatsClientHandle {
     /// stores when operators bind `cluster: { kind: nats }` and skip
     /// per-capability overrides.
     pub(crate) state: KvStore,
+    /// What a bucket asked for by name is created with.
+    js: JsContext,
+    state_bucket: String,
+    replicas: u32,
+    storage: async_nats::jetstream::stream::StorageType,
+    named_max_bytes: i64,
 }
 
 impl NatsClientHandle {
@@ -109,7 +115,36 @@ impl NatsClientHandle {
             leases,
             fencing,
             state,
+            js,
+            state_bucket: cfg.jetstream.state_bucket.clone(),
+            replicas: cfg.jetstream.replicas,
+            storage,
+            named_max_bytes: i64::try_from(cfg.jetstream.named_bucket_max_bytes)
+                .unwrap_or(i64::MAX),
         })
+    }
+
+    /// The bucket a capability asks for by `name`: `{state_bucket}-{name}`,
+    /// created on first use.
+    pub(crate) async fn named_bucket(&self, name: &str) -> Result<KvStore, ClusterError> {
+        let suffix: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        ensure_kv_bucket(
+            &self.js,
+            &format!("{}-{suffix}", self.state_bucket),
+            self.replicas,
+            self.named_max_bytes,
+            self.storage,
+        )
+        .await
     }
 }
 

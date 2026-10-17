@@ -153,6 +153,12 @@ pub struct JetStreamConfig {
     /// stay on `file`.
     #[serde(default = "default_storage")]
     pub storage: KvStorage,
+
+    /// Byte cap of each bucket a capability asks for by name, created
+    /// on first use as `{state_bucket}-{name}` (MCP Events keeps its log
+    /// and subscriptions in `{state_bucket}-events`). Default 256 MiB.
+    #[serde(default = "default_named_bucket_max_bytes")]
+    pub named_bucket_max_bytes: u64,
 }
 
 /// JetStream KV storage backend selector.
@@ -176,6 +182,7 @@ impl Default for JetStreamConfig {
             state_bucket: default_state_bucket(),
             replicas: default_replicas(),
             storage: default_storage(),
+            named_bucket_max_bytes: default_named_bucket_max_bytes(),
         }
     }
 }
@@ -265,6 +272,9 @@ fn default_notifications_stream() -> String {
 }
 fn default_state_bucket() -> String {
     "mcpg-state".into()
+}
+fn default_named_bucket_max_bytes() -> u64 {
+    256 * 1024 * 1024
 }
 fn default_replicas() -> u32 {
     1

@@ -116,6 +116,90 @@ struct Connected {
 struct NatsPrimitives {
     kv: Arc<NatsKv>,
     pub_sub: Arc<NatsTopicBus>,
+    /// The buckets capabilities asked for by name, opened on first use.
+    named: tokio::sync::Mutex<std::collections::HashMap<String, Arc<NatsKv>>>,
+}
+
+impl Connected {
+    /// The KV on the bucket named `bucket`, or on the shared state bucket.
+    async fn kv(&self, bucket: Option<&str>) -> Result<Arc<NatsKv>, ClusterError> {
+        let Some(name) = bucket else {
+            return Ok(Arc::clone(&self.primitives.kv));
+        };
+        let mut named = self.primitives.named.lock().await;
+        if let Some(kv) = named.get(name) {
+            return Ok(Arc::clone(kv));
+        }
+        let kv = Arc::new(NatsKv::with_store(self.client.named_bucket(name).await?));
+        named.insert(name.to_owned(), Arc::clone(&kv));
+        Ok(kv)
+    }
+}
+
+/// The in-process view of a named bucket: connects and opens it on first
+/// use.
+struct NamedKv {
+    inner: Arc<NatsJetStreamInner>,
+    name: String,
+}
+
+impl std::fmt::Debug for NamedKv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamedKv").field("name", &self.name).finish()
+    }
+}
+
+impl NamedKv {
+    async fn kv(&self) -> Result<Arc<NatsKv>, ClusterError> {
+        get_or_init_connected(&self.inner)
+            .await?
+            .kv(Some(&self.name))
+            .await
+    }
+}
+
+#[async_trait]
+impl KeyValueStore for NamedKv {
+    async fn get(&self, key: &str) -> Result<Option<mcpg_cluster_api::Entry>, ClusterError> {
+        self.kv().await?.get(key).await
+    }
+    async fn put(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<(), ClusterError> {
+        self.kv().await?.put(key, value, ttl).await
+    }
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<bool, ClusterError> {
+        self.kv().await?.put_if_absent(key, value, ttl).await
+    }
+    async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
+        self.kv().await?.delete(key).await
+    }
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, mcpg_cluster_api::Entry)>, ClusterError> {
+        self.kv().await?.list_prefix(prefix, limit).await
+    }
+    async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError> {
+        self.kv().await?.expire(key, ttl).await
+    }
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.kv().await?.incr(key, delta, ttl).await
+    }
 }
 
 impl NatsJetStreamCoordinator {
@@ -265,6 +349,7 @@ async fn get_or_init_connected(
             let primitives = NatsPrimitives {
                 kv: Arc::new(NatsKv::with_store(client.state.clone())),
                 pub_sub: Arc::new(NatsTopicBus::with_client(client.nats.clone())),
+                named: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             };
 
             Ok::<Connected, ClusterError>(Connected {
@@ -308,6 +393,13 @@ impl ClusterBackend for NatsJetStreamCoordinator {
             .connected
             .get()
             .map(|c| Arc::clone(&c.primitives.kv) as Arc<dyn KeyValueStore>)
+    }
+
+    fn key_value_store_named(&self, name: &str) -> Option<Arc<dyn KeyValueStore>> {
+        Some(Arc::new(NamedKv {
+            inner: Arc::clone(&self.inner),
+            name: name.to_owned(),
+        }))
     }
 
     fn pub_sub(&self) -> Option<Arc<dyn PubSub>> {
@@ -731,17 +823,11 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
     // each method through the JetStream `KeyValueStore` impl that
     // `key_value_store()` exposes.
     fn kv_get(&self, key: &str) -> Result<Option<mcpg_cluster_api::Entry>, ClusterError> {
-        let kv = Arc::clone(&self.require_connected()?.primitives.kv);
-        self.inner
-            .runtime
-            .block_on(async move { kv.get(key).await })
+        self.kv_get_in(None, key)
     }
 
     fn kv_put(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>) -> Result<(), ClusterError> {
-        let kv = Arc::clone(&self.require_connected()?.primitives.kv);
-        self.inner
-            .runtime
-            .block_on(async move { kv.put(key, Bytes::from(value), ttl_from_ms(ttl_ms)).await })
+        self.kv_put_in(None, key, value, ttl_ms)
     }
 
     fn kv_put_if_absent(
@@ -750,18 +836,11 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
         value: Vec<u8>,
         ttl_ms: Option<u64>,
     ) -> Result<bool, ClusterError> {
-        let kv = Arc::clone(&self.require_connected()?.primitives.kv);
-        self.inner.runtime.block_on(async move {
-            kv.put_if_absent(key, Bytes::from(value), ttl_from_ms(ttl_ms))
-                .await
-        })
+        self.kv_put_if_absent_in(None, key, value, ttl_ms)
     }
 
     fn kv_delete(&self, key: &str) -> Result<bool, ClusterError> {
-        let kv = Arc::clone(&self.require_connected()?.primitives.kv);
-        self.inner
-            .runtime
-            .block_on(async move { kv.delete(key).await })
+        self.kv_delete_in(None, key)
     }
 
     fn kv_list_prefix(
@@ -769,24 +848,112 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, mcpg_cluster_api::Entry)>, ClusterError> {
-        let kv = Arc::clone(&self.require_connected()?.primitives.kv);
-        self.inner
-            .runtime
-            .block_on(async move { kv.list_prefix(prefix, limit).await })
+        self.kv_list_prefix_in(None, prefix, limit)
     }
 
     fn kv_expire(&self, key: &str, ttl_ms: Option<u64>) -> Result<bool, ClusterError> {
-        let kv = Arc::clone(&self.require_connected()?.primitives.kv);
-        self.inner
-            .runtime
-            .block_on(async move { kv.expire(key, ttl_from_ms(ttl_ms)).await })
+        self.kv_expire_in(None, key, ttl_ms)
     }
 
     fn kv_incr(&self, key: &str, delta: i64, ttl_ms: Option<u64>) -> Result<i64, ClusterError> {
-        let kv = Arc::clone(&self.require_connected()?.primitives.kv);
+        self.kv_incr_in(None, key, delta, ttl_ms)
+    }
+
+    fn kv_get_in(
+        &self,
+        bucket: Option<&str>,
+        key: &str,
+    ) -> Result<Option<mcpg_cluster_api::Entry>, ClusterError> {
+        let connected = self.require_connected()?;
         self.inner
             .runtime
-            .block_on(async move { kv.incr(key, delta, ttl_from_ms(ttl_ms)).await })
+            .block_on(async move { connected.kv(bucket).await?.get(key).await })
+    }
+
+    fn kv_put_in(
+        &self,
+        bucket: Option<&str>,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(), ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner.runtime.block_on(async move {
+            connected
+                .kv(bucket)
+                .await?
+                .put(key, Bytes::from(value), ttl_from_ms(ttl_ms))
+                .await
+        })
+    }
+
+    fn kv_put_if_absent_in(
+        &self,
+        bucket: Option<&str>,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+    ) -> Result<bool, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner.runtime.block_on(async move {
+            connected
+                .kv(bucket)
+                .await?
+                .put_if_absent(key, Bytes::from(value), ttl_from_ms(ttl_ms))
+                .await
+        })
+    }
+
+    fn kv_delete_in(&self, bucket: Option<&str>, key: &str) -> Result<bool, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner
+            .runtime
+            .block_on(async move { connected.kv(bucket).await?.delete(key).await })
+    }
+
+    fn kv_list_prefix_in(
+        &self,
+        bucket: Option<&str>,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, mcpg_cluster_api::Entry)>, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner
+            .runtime
+            .block_on(async move { connected.kv(bucket).await?.list_prefix(prefix, limit).await })
+    }
+
+    fn kv_expire_in(
+        &self,
+        bucket: Option<&str>,
+        key: &str,
+        ttl_ms: Option<u64>,
+    ) -> Result<bool, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner.runtime.block_on(async move {
+            connected
+                .kv(bucket)
+                .await?
+                .expire(key, ttl_from_ms(ttl_ms))
+                .await
+        })
+    }
+
+    fn kv_incr_in(
+        &self,
+        bucket: Option<&str>,
+        key: &str,
+        delta: i64,
+        ttl_ms: Option<u64>,
+    ) -> Result<i64, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner.runtime.block_on(async move {
+            connected
+                .kv(bucket)
+                .await?
+                .incr(key, delta, ttl_from_ms(ttl_ms))
+                .await
+        })
     }
 }
 
