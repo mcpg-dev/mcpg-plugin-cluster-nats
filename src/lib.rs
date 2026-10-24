@@ -572,17 +572,18 @@ impl ClusterBackend for NatsJetStreamCoordinator {
     }
 
     async fn shutdown(&self) {
-        // Proactively abort the heartbeat publisher + subscriber tasks
-        // now, rather than waiting for `PeerWorkers::Drop` (which fires
-        // only when the last `Arc<Inner>` ref is released — possibly
-        // delayed by an outstanding lease handle). No-op if the broker
-        // was never reached (no peer workers spawned).
+        // Leave the peer list and stop the heartbeat publisher +
+        // subscriber tasks now, rather than waiting for
+        // `PeerWorkers::Drop` (which fires only when the last
+        // `Arc<Inner>` ref is released — possibly delayed by an
+        // outstanding lease handle). No-op if the broker was never
+        // reached (no peer workers spawned).
         if let Some(c) = self.inner.connected.get() {
-            c.peers.abort();
+            c.peers.leave().await;
         }
         tracing::info!(
             plugin_id = PLUGIN_ID,
-            "nats cluster: shutdown — peer workers aborted"
+            "nats cluster: shutdown — left the peer list, peer workers aborted"
         );
     }
 }
@@ -592,16 +593,16 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
         &self.inner.manifest
     }
 
-    /// Abort the peer-worker background tasks within the host drain
-    /// window instead of relying on `Drop`. No-op if the broker was
-    /// never reached (no peer workers spawned).
+    /// Leave the peer list and abort the peer-worker background tasks
+    /// within the host drain window instead of relying on `Drop`. No-op
+    /// if the broker was never reached (no peer workers spawned).
     fn shutdown(&self) {
         if let Some(c) = self.inner.connected.get() {
-            c.peers.abort();
+            self.inner.runtime.block_on(c.peers.leave());
         }
         tracing::info!(
             plugin_id = PLUGIN_ID,
-            "nats cluster: shutdown — peer workers aborted"
+            "nats cluster: shutdown — left the peer list, peer workers aborted"
         );
     }
 

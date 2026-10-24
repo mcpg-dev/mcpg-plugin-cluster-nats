@@ -12,6 +12,8 @@
 //!    `Arc<RwLock<...>>`.
 //! 3. A **sweeper** that runs alongside the subscriber and
 //!    re-classifies / evicts entries past `peer_expiry_sec`.
+//! 4. At shutdown, one last heartbeat with `leaving: true`, on which
+//!    the subscribers evict the node at once.
 //!
 //! `list_peers` reads a snapshot of the cache. `watch_peers`
 //! subscribes to delta events emitted from the folder + sweeper
@@ -57,7 +59,15 @@ struct HeartbeatPayload {
     node_id: String,
     address: String,
     started_at: String,
+    /// The node stops: peers drop it now rather than after
+    /// `peer_expiry_sec`. A subscriber that predates the field takes it
+    /// as one more heartbeat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    leaving: bool,
 }
+
+/// Bound on publishing the leaving heartbeat at shutdown.
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// In-memory per-peer record. `last_seen` is a monotonic Instant
 /// (more reliable than clock for expiry); the wire-shape `last_seen`
@@ -79,6 +89,8 @@ pub(crate) struct PeerWorkers {
     pub(crate) cache: PeerCache,
     publisher_abort: AbortHandle,
     subscriber_abort: AbortHandle,
+    nats: NatsClient,
+    leaving: HeartbeatPayload,
 }
 
 impl Drop for PeerWorkers {
@@ -95,6 +107,28 @@ impl PeerWorkers {
     pub(crate) fn abort(&self) {
         self.publisher_abort.abort();
         self.subscriber_abort.abort();
+    }
+
+    /// Stop heartbeating, tell the peers this node leaves, then
+    /// [`Self::abort`]. A failed or slow publish leaves the peers to
+    /// expire this node as before.
+    pub(crate) async fn leave(&self) {
+        self.publisher_abort.abort();
+        let subject = format!("{HEARTBEAT_SUBJECT_PREFIX}.{}", self.leaving.node_id);
+        let payload = serde_json::to_vec(&self.leaving).unwrap_or_default();
+        let sent = tokio::time::timeout(LEAVE_TIMEOUT, async {
+            self.nats
+                .publish(subject, Bytes::from(payload))
+                .await
+                .map_err(|e| e.to_string())?;
+            self.nats.flush().await.map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("timed out".to_owned()));
+        if let Err(error) = sent {
+            tracing::warn!(error = %error, "nats cluster: leaving heartbeat not sent; peers expire this node");
+        }
+        self.abort();
     }
 }
 
@@ -113,18 +147,20 @@ impl PeerWorkers {
         let node_id = cfg.node.id.clone();
         let address = cfg.node.address.clone().unwrap_or_default();
 
+        let heartbeat = HeartbeatPayload {
+            node_id: node_id.clone(),
+            address,
+            started_at: started_at_rfc3339,
+            leaving: false,
+        };
         let publisher = rt.spawn(publisher_loop(
             nats.clone(),
             heartbeat_interval,
-            HeartbeatPayload {
-                node_id: node_id.clone(),
-                address: address.clone(),
-                started_at: started_at_rfc3339,
-            },
+            heartbeat.clone(),
         ));
 
         let subscriber = rt.spawn(subscriber_loop(
-            nats,
+            nats.clone(),
             Arc::clone(&cache),
             heartbeat_interval,
             degraded_after,
@@ -137,6 +173,11 @@ impl PeerWorkers {
             cache,
             publisher_abort: publisher.abort_handle(),
             subscriber_abort: subscriber.abort_handle(),
+            nats,
+            leaving: HeartbeatPayload {
+                leaving: true,
+                ..heartbeat
+            },
         }
     }
 
@@ -242,8 +283,15 @@ async fn subscriber_loop(
                     // Heartbeat echoed our own node — ignore.
                     continue;
                 }
-                // Parse the payload only for the advisory `address` (self-reported).
+                // Parse the payload only for the advisory `address` (self-reported)
+                // and the leaving flag.
                 let address = match serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
+                    Ok(p) if p.leaving => {
+                        if cache.write().await.remove(&node_id).is_some() {
+                            let _ = events.send(PeerEvent::Left { node_id });
+                        }
+                        continue;
+                    }
                     Ok(p) => {
                         if p.node_id != node_id {
                             tracing::warn!(

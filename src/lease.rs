@@ -42,7 +42,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_nats::jetstream::kv::Store as KvStore;
+use async_nats::jetstream::kv::{Operation, Store as KvStore};
 use bytes::Bytes;
 use mcpg_cluster_api::{ActiveLease, ClusterError};
 use mcpg_plugin_protocol::async_trait;
@@ -446,23 +446,7 @@ pub(crate) fn renew(
 /// refreshed `expires_at`. Caller decides whether to surface
 /// the result to the trait-method caller or just log + retry.
 async fn renew_inner(inner: &LeaseInner) -> Result<String, ClusterError> {
-    let entry =
-        inner
-            .leases
-            .entry(&inner.key)
-            .await
-            .map_err(|e| ClusterError::BackendUnavailable {
-                reason: format!("lease renew read: {e}"),
-            })?;
-    let entry = match entry {
-        Some(e) => e,
-        None => return Err(ClusterError::LeaseExpired),
-    };
-    let record: LeaseRecord = serde_json::from_slice(&entry.value)
-        .map_err(|e| crate::error::json_decode_to_cluster("lease_renew", e))?;
-    if record.node_id != inner.node_id || record.fencing_token != inner.fencing_token {
-        return Err(ClusterError::LeaseExpired);
-    }
+    let (record, revision) = read_held(inner).await?;
     let (expires_at, expires_at_unix) = expiry_for(inner.ttl);
     let new_record = LeaseRecord {
         expires_at,
@@ -470,26 +454,45 @@ async fn renew_inner(inner: &LeaseInner) -> Result<String, ClusterError> {
         ..record
     };
     let new_value = Bytes::from(serde_json::to_vec(&new_record).expect("LeaseRecord serialises"));
-    inner
-        .leases
-        .update(&inner.key, new_value, entry.revision)
-        .await
-        .map_err(|e| {
-            // Pre-condition mismatch on revision = lost the lease
-            // to another writer between read and update.
+    let renewed = match inner.leases.update(&inner.key, new_value, revision).await {
+        Ok(_) => new_record,
+        Err(e) => {
             let s = e.to_string();
-            if s.contains("wrong last sequence") || s.contains("revision") {
-                ClusterError::LeaseExpired
-            } else {
-                ClusterError::BackendUnavailable {
+            if !(s.contains("wrong last sequence") || s.contains("revision")) {
+                return Err(ClusterError::BackendUnavailable {
                     reason: format!("lease renew update: {s}"),
-                }
+                });
             }
-        })?;
+            // The renewal task and a host-driven renew of this same lease
+            // race on the revision, so a lost CAS is a lost lease only when
+            // the record now names another holder.
+            read_held(inner).await?.0
+        }
+    };
     if let Ok(mut g) = inner.expires_at.lock() {
-        g.clone_from(&new_record.expires_at);
+        g.clone_from(&renewed.expires_at);
     }
-    Ok(new_record.expires_at)
+    Ok(renewed.expires_at)
+}
+
+/// The lease's current record and revision, or `LeaseExpired` when the
+/// key is gone or now belongs to another holder.
+async fn read_held(inner: &LeaseInner) -> Result<(LeaseRecord, u64), ClusterError> {
+    let entry = inner
+        .leases
+        .entry(&inner.key)
+        .await
+        .map_err(|e| ClusterError::BackendUnavailable {
+            reason: format!("lease renew read: {e}"),
+        })?
+        .filter(|e| e.operation == Operation::Put)
+        .ok_or(ClusterError::LeaseExpired)?;
+    let record: LeaseRecord = serde_json::from_slice(&entry.value)
+        .map_err(|e| crate::error::json_decode_to_cluster("lease_renew", e))?;
+    if record.node_id != inner.node_id || record.fencing_token != inner.fencing_token {
+        return Err(ClusterError::LeaseExpired);
+    }
+    Ok((record, entry.revision))
 }
 
 /// Async core for [`release`]. Idempotent — if the slot is gone
