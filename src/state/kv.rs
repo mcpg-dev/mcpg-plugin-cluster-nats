@@ -13,6 +13,7 @@ use futures::{StreamExt, TryStreamExt};
 use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, KvPage};
 
 use super::index;
+use crate::record::last_record;
 
 /// JetStream KV-backed state.
 ///
@@ -220,25 +221,23 @@ pub struct BucketUsage {
 
 impl NatsKv {
     async fn slot(&self, encoded: &str, key: &str) -> Result<Slot, ClusterError> {
-        let entry =
-            self.store
-                .entry(encoded)
-                .await
-                .map_err(|e| ClusterError::BackendUnavailable {
-                    reason: format!("nats kv entry `{key}`: {e}"),
-                })?;
-        Ok(match entry {
+        let record = last_record(&self.store, encoded).await.map_err(|e| {
+            ClusterError::BackendUnavailable {
+                reason: format!("nats kv entry `{key}`: {e}"),
+            }
+        })?;
+        Ok(match record {
             None => Slot::Empty,
-            Some(e) if e.operation != Operation::Put => Slot::Dead(e.revision),
-            Some(e) => {
-                let (value, expires_at_secs) = decode_value(e.value);
+            Some(r) if r.operation != Operation::Put => Slot::Dead(r.revision),
+            Some(r) => {
+                let (value, expires_at_secs) = decode_value(r.payload);
                 if is_expired(expires_at_secs) {
-                    Slot::Dead(e.revision)
+                    Slot::Dead(r.revision)
                 } else {
                     Slot::Live {
                         value,
                         expires_at_secs,
-                        revision: e.revision,
+                        revision: r.revision,
                     }
                 }
             }
@@ -758,18 +757,17 @@ impl NatsKv {
         encoded: &str,
         sequence: u64,
     ) -> Result<LegacyOutcome, ClusterError> {
-        let entry =
-            self.store
-                .entry(encoded)
-                .await
-                .map_err(|e| ClusterError::BackendUnavailable {
-                    reason: format!("nats kv sweep entry: {e}"),
-                })?;
-        let Some(entry) = entry.filter(|e| e.revision == sequence && e.operation == Operation::Put)
+        let record = last_record(&self.store, encoded).await.map_err(|e| {
+            ClusterError::BackendUnavailable {
+                reason: format!("nats kv sweep entry: {e}"),
+            }
+        })?;
+        let Some(record) =
+            record.filter(|r| r.revision == sequence && r.operation == Operation::Put)
         else {
             return Ok(LegacyOutcome::Moved);
         };
-        let (value, expires_at_secs) = decode_value(entry.value);
+        let (value, expires_at_secs) = decode_value(record.payload);
         let key = decode_key(encoded);
         if is_expired(expires_at_secs) {
             self.remove_dead(&format!("{}{encoded}", self.store.prefix), sequence)

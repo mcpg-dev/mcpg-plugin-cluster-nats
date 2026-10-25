@@ -27,6 +27,7 @@ mod error;
 mod lease;
 mod peer;
 mod pubsub;
+mod record;
 mod state;
 mod sweep;
 

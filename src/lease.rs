@@ -42,7 +42,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_nats::jetstream::kv::{Operation, Store as KvStore};
+use async_nats::jetstream::kv::{DeleteErrorKind, Operation, Store as KvStore, UpdateErrorKind};
 use bytes::Bytes;
 use mcpg_cluster_api::{ActiveLease, ClusterError};
 use mcpg_plugin_protocol::async_trait;
@@ -50,6 +50,8 @@ use mcpg_plugin_sdk::ffi::WatchHandleBox;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::task::AbortHandle;
+
+use crate::record::last_record;
 
 const FENCING_KEY_PREFIX: &str = "fencing";
 const ACQUIRE_LEADERSHIP_RETRY_MS: u64 = 500;
@@ -478,16 +480,14 @@ async fn renew_inner(inner: &LeaseInner) -> Result<String, ClusterError> {
 /// The lease's current record and revision, or `LeaseExpired` when the
 /// key is gone or now belongs to another holder.
 async fn read_held(inner: &LeaseInner) -> Result<(LeaseRecord, u64), ClusterError> {
-    let entry = inner
-        .leases
-        .entry(&inner.key)
+    let entry = last_record(&inner.leases, &inner.key)
         .await
         .map_err(|e| ClusterError::BackendUnavailable {
             reason: format!("lease renew read: {e}"),
         })?
         .filter(|e| e.operation == Operation::Put)
         .ok_or(ClusterError::LeaseExpired)?;
-    let record: LeaseRecord = serde_json::from_slice(&entry.value)
+    let record: LeaseRecord = serde_json::from_slice(&entry.payload)
         .map_err(|e| crate::error::json_decode_to_cluster("lease_renew", e))?;
     if record.node_id != inner.node_id || record.fencing_token != inner.fencing_token {
         return Err(ClusterError::LeaseExpired);
@@ -499,19 +499,16 @@ async fn read_held(inner: &LeaseInner) -> Result<(LeaseRecord, u64), ClusterErro
 /// (already released, expired, taken by another node) returns
 /// Ok per the trait's "release is best-effort" contract.
 pub(crate) async fn release_async(inner: &LeaseInner) -> Result<(), ClusterError> {
-    let entry =
-        inner
-            .leases
-            .entry(&inner.key)
-            .await
-            .map_err(|e| ClusterError::BackendUnavailable {
-                reason: format!("lease release read: {e}"),
-            })?;
+    let entry = last_record(&inner.leases, &inner.key).await.map_err(|e| {
+        ClusterError::BackendUnavailable {
+            reason: format!("lease release read: {e}"),
+        }
+    })?;
     let entry = match entry {
         Some(e) => e,
         None => return Ok(()), // already gone
     };
-    let record: LeaseRecord = match serde_json::from_slice(&entry.value) {
+    let record: LeaseRecord = match serde_json::from_slice(&entry.payload) {
         Ok(r) => r,
         // Garbled entry (operator wrote into our bucket) — let
         // it stay; we don't own it.
@@ -522,14 +519,18 @@ pub(crate) async fn release_async(inner: &LeaseInner) -> Result<(), ClusterError
         // for us to release.
         return Ok(());
     }
-    inner
+    // Only the record read: a node that reclaimed the lease since keeps it.
+    match inner
         .leases
-        .delete(&inner.key)
+        .delete_expect_revision(&inner.key, Some(entry.revision))
         .await
-        .map_err(|e| ClusterError::BackendUnavailable {
+    {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == DeleteErrorKind::WrongLastRevision => Ok(()),
+        Err(e) => Err(ClusterError::BackendUnavailable {
             reason: format!("lease release delete: {e}"),
-        })?;
-    Ok(())
+        }),
+    }
 }
 
 /// Sync FFI wrapper around [`release_async`].
@@ -545,51 +546,30 @@ async fn bump_fencing_token(fencing: &KvStore, key: &str) -> Result<u64, Cluster
     // Loop the CAS until we land a successful update; bounded so a
     // pathological contender can't spin us forever.
     for _ in 0..16 {
-        let entry = fencing
-            .entry(&path)
-            .await
-            .map_err(|e| ClusterError::BackendUnavailable {
-                reason: format!("fencing read: {e}"),
-            })?;
+        let entry =
+            last_record(fencing, &path)
+                .await
+                .map_err(|e| ClusterError::BackendUnavailable {
+                    reason: format!("fencing read: {e}"),
+                })?;
         let next: u64 = match &entry {
             Some(e) => {
-                let s = std::str::from_utf8(&e.value).unwrap_or("0");
+                let s = std::str::from_utf8(&e.payload).unwrap_or("0");
                 s.parse::<u64>().unwrap_or(0).saturating_add(1)
             }
             None => 1,
         };
         let value = Bytes::from(next.to_string().into_bytes());
-        // Convert both arms to a common `Result<(), String>` so
-        // the borrow checker sees one error type. The two upstream
-        // futures return `Error<UpdateErrorKind>` and
-        // `Error<CreateErrorKind>` respectively; we don't need the
-        // typed shape — we pivot on the message text.
-        let result: Result<(), String> = match entry {
-            Some(e) => fencing
-                .update(&path, value, e.revision)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            None => fencing
-                .create(&path, value)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-        };
-        match result {
-            Ok(()) => return Ok(next),
-            Err(s) => {
-                if s.contains("wrong last sequence")
-                    || s.contains("revision")
-                    || s.contains("already exists")
-                {
-                    // Lost the CAS race; retry with the fresh
-                    // sequence. Fencing tokens MAY skip values —
-                    // the trait only requires monotonicity.
-                    continue;
-                }
+        // Revision 0: the key holds no record yet.
+        let revision = entry.as_ref().map_or(0, |e| e.revision);
+        match fencing.update(&path, value, revision).await {
+            Ok(_) => return Ok(next),
+            // Lost the CAS race; retry with the fresh sequence. Fencing
+            // tokens MAY skip values — the trait only requires monotonicity.
+            Err(e) if e.kind() == UpdateErrorKind::WrongLastRevision => continue,
+            Err(e) => {
                 return Err(ClusterError::BackendUnavailable {
-                    reason: format!("fencing CAS: {s}"),
+                    reason: format!("fencing CAS: {e}"),
                 });
             }
         }
@@ -606,51 +586,50 @@ async fn try_create(
     _ttl: Duration,
 ) -> AcquireOutcome {
     let value = Bytes::from(serde_json::to_vec(record).expect("LeaseRecord serialises"));
-    match leases.create(key, value.clone()).await {
+    // Create-only (the key holds no record), without the KV client's
+    // `create`, which reads the key with a direct get on a collision.
+    match leases.update(key, value.clone(), 0).await {
         Ok(rev) => AcquireOutcome::Acquired(record.clone(), rev),
-        Err(e) => {
-            let s = e.to_string();
-            // async-nats reports key-already-exists as a "wrong
-            // last sequence" error on `create`. The slot is occupied.
-            if s.contains("wrong last sequence")
-                || s.contains("already exists")
-                || s.contains("constraint")
-            {
-                // NATS JetStream KV has no per-key TTL, so a holder
-                // that crashed without `release` would otherwise wedge
-                // this slot forever (every peer's `create` keeps seeing
-                // the stale key). Reclaim an EXPIRED incumbent via a
-                // CAS-replace; a live one is genuinely Held.
-                reclaim_if_expired(leases, key, record, value).await
-            } else {
-                AcquireOutcome::BackendError(format!("kv create: {s}"))
-            }
+        // NATS JetStream KV has no per-key TTL, so a holder that crashed
+        // without `release` would otherwise wedge this slot forever.
+        // Reclaim a released or EXPIRED lease via a CAS-replace; a live
+        // one is genuinely Held.
+        Err(e) if e.kind() == UpdateErrorKind::WrongLastRevision => {
+            reclaim_if_expired(leases, key, record, value).await
         }
+        Err(e) => AcquireOutcome::BackendError(format!("kv create: {e}")),
     }
 }
 
-/// On a `create` collision, read the incumbent lease record; if it has
-/// lapsed ([`lease_is_expired`]), CAS-replace it with ours to reclaim a
-/// crashed holder's slot. Our record carries a fresh, strictly-higher
-/// fencing token (minted by the caller before this attempt), so a
-/// resurrected dead holder writing with its old, lower token is still
-/// fenced out — reclamation is split-brain-safe. Anything else (live
-/// incumbent, unparseable record, lost CAS race, vanished key) → `Held`.
+/// On a create collision, read the key's last record: over a released
+/// lease's delete marker, or an incumbent that has lapsed
+/// ([`lease_is_expired`]), CAS-replace it with ours. Our record carries a
+/// fresh, strictly-higher fencing token (minted by the caller before this
+/// attempt), so a resurrected dead holder writing with its old, lower
+/// token is still fenced out — reclamation is split-brain-safe. Anything
+/// else (live incumbent, unparseable record, lost CAS race, vanished key)
+/// → `Held`.
 async fn reclaim_if_expired(
     leases: &KvStore,
     key: &str,
     record: &LeaseRecord,
     value: Bytes,
 ) -> AcquireOutcome {
-    let entry = match leases.entry(key).await {
+    let entry = match last_record(leases, key).await {
         Ok(Some(e)) => e,
-        // Key vanished between the failed create and this read (released
+        // Key vanished between the failed create and this read (purged
         // concurrently) — treat as Held for this attempt; the blocking
-        // caller retries and will `create` cleanly next pass.
+        // caller retries and will create cleanly next pass.
         Ok(None) => return AcquireOutcome::Held,
         Err(e) => return AcquireOutcome::BackendError(format!("lease reclaim read: {e}")),
     };
-    let incumbent: LeaseRecord = match serde_json::from_slice(&entry.value) {
+    if entry.operation != Operation::Put {
+        return match leases.update(key, value, entry.revision).await {
+            Ok(rev) => AcquireOutcome::Acquired(record.clone(), rev),
+            Err(_) => AcquireOutcome::Held,
+        };
+    }
+    let incumbent: LeaseRecord = match serde_json::from_slice(&entry.payload) {
         Ok(r) => r,
         // Don't blindly stomp a record we can't parse.
         Err(_) => return AcquireOutcome::Held,
