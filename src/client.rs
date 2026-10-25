@@ -34,8 +34,11 @@ pub(crate) struct NatsClientHandle {
     /// stores when operators bind `cluster: { kind: nats }` and skip
     /// per-capability overrides.
     pub(crate) state: KvStore,
-    /// What a bucket asked for by name is created with.
-    js: JsContext,
+    /// What a bucket asked for by name is created with, and what the
+    /// state buckets publish their writes on.
+    pub(crate) js: JsContext,
+    /// The API prefix of `js`: `$JS.API`, or `$JS.<domain>.API`.
+    pub(crate) api_prefix: String,
     state_bucket: String,
     replicas: u32,
     storage: async_nats::jetstream::stream::StorageType,
@@ -47,11 +50,12 @@ impl NatsClientHandle {
         let opts = build_connect_options(cfg)
             .await
             .map_err(|reason| ClusterError::BackendUnavailable { reason })?;
-        let server_str = cfg.servers.join(",");
+        let servers = server_addrs(&cfg.servers)
+            .map_err(|reason| ClusterError::BackendUnavailable { reason })?;
 
         let nats = tokio::time::timeout(
             Duration::from_millis(cfg.connection.connect_timeout_ms),
-            opts.connect(server_str),
+            opts.connect(servers),
         )
         .await
         .map_err(|_| ClusterError::BackendUnavailable {
@@ -64,11 +68,18 @@ impl NatsClientHandle {
             reason: format!("nats connect: {e}"),
         })?;
 
-        let js = if let Some(domain) = cfg.jetstream.domain.as_ref().filter(|s| !s.is_empty()) {
-            async_nats::jetstream::with_domain(nats.clone(), domain.clone())
-        } else {
-            async_nats::jetstream::new(nats.clone())
-        };
+        let (js, api_prefix) =
+            if let Some(domain) = cfg.jetstream.domain.as_ref().filter(|s| !s.is_empty()) {
+                (
+                    async_nats::jetstream::with_domain(nats.clone(), domain.clone()),
+                    format!("$JS.{domain}.API"),
+                )
+            } else {
+                (
+                    async_nats::jetstream::new(nats.clone()),
+                    "$JS.API".to_owned(),
+                )
+            };
 
         // Idempotent KV bucket creation. async-nats' `create_key_value`
         // returns the existing bucket if it matches; we treat
@@ -97,15 +108,13 @@ impl NatsClientHandle {
             storage,
         )
         .await?;
-        // Bucket the `KeyValueStore` primitive accessor hands out.
-        // 64 MiB cap matches the cluster.redis primitive's
-        // sizing default; capabilities that need more set a per-cap
-        // override pointing at a dedicated bucket.
+        // Bucket the `KeyValueStore` primitive accessor hands out;
+        // capabilities that need room of their own ask for a named one.
         let state = ensure_kv_bucket(
             &js,
             &cfg.jetstream.state_bucket,
             cfg.jetstream.replicas,
-            64 * 1024 * 1024,
+            i64::try_from(cfg.jetstream.state_bucket_max_bytes).unwrap_or(i64::MAX),
             storage,
         )
         .await?;
@@ -116,6 +125,7 @@ impl NatsClientHandle {
             fencing,
             state,
             js,
+            api_prefix,
             state_bucket: cfg.jetstream.state_bucket.clone(),
             replicas: cfg.jetstream.replicas,
             storage,
@@ -146,6 +156,19 @@ impl NatsClientHandle {
         )
         .await
     }
+}
+
+/// The servers the client connects to: one per URL of `servers`. The client
+/// reads a string as one address, so the list cannot travel joined.
+fn server_addrs(servers: &[String]) -> Result<Vec<async_nats::ServerAddr>, String> {
+    servers
+        .iter()
+        .map(|url| {
+            url.trim()
+                .parse::<async_nats::ServerAddr>()
+                .map_err(|e| format!("nats connect: `{url}` is not a NATS server URL: {e}"))
+        })
+        .collect()
 }
 
 async fn build_connect_options(cfg: &ClusterNatsConfig) -> Result<ConnectOptions, String> {
@@ -267,13 +290,14 @@ async fn ensure_kv_bucket(
 ) -> Result<KvStore, ClusterError> {
     use async_nats::jetstream::kv::Config as KvConfig;
 
-    // Fast path: bucket already exists. We reuse it as-is — the
-    // storage backend is fixed at create time and JS doesn't
-    // support migrating between memory + file in place. If the
-    // pre-existing bucket has a different storage backend than
-    // the operator now requests, that's a deliberate operator
-    // choice; we honour it without erroring.
+    // Fast path: bucket already exists. We reuse it — the storage
+    // backend is fixed at create time and JS doesn't support
+    // migrating between memory + file in place. If the pre-existing
+    // bucket has a different storage backend than the operator now
+    // requests, that's a deliberate operator choice; we honour it
+    // without erroring. Only a byte cap below `max_bytes` changes.
     if let Ok(store) = js.get_key_value(name).await {
+        grow_bucket(js, &store, max_bytes).await;
         return Ok(store);
     }
 
@@ -318,6 +342,34 @@ async fn ensure_kv_bucket(
     }
 }
 
+/// Raise the byte cap of an existing bucket to `max_bytes`. A cap is never
+/// lowered here (below its contents the bucket would refuse every write),
+/// and an unlimited one stays so. The server can refuse the larger
+/// reservation; the bucket then keeps its cap and the refusal is logged.
+async fn grow_bucket(js: &JsContext, store: &KvStore, max_bytes: i64) {
+    let mut config = store.stream.cached_info().config.clone();
+    let current = config.max_bytes;
+    if current < 0 || current >= max_bytes {
+        return;
+    }
+    config.max_bytes = max_bytes;
+    match js.update_stream(&config).await {
+        Ok(_) => tracing::info!(
+            bucket = %store.name,
+            from = current,
+            to = max_bytes,
+            "nats cluster: raised the byte cap of a KV bucket"
+        ),
+        Err(error) => tracing::warn!(
+            bucket = %store.name,
+            current,
+            requested = max_bytes,
+            error = %error,
+            "nats cluster: the byte cap of a KV bucket could not be raised; it keeps its cap"
+        ),
+    }
+}
+
 /// Detect the JS error pattern that indicates the cluster doesn't
 /// have enough peers to satisfy the requested replica count.
 /// async-nats wraps the upstream JS error in a `String`-able Error;
@@ -347,6 +399,32 @@ MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAL5syMJr7h2NAxJW\n\
 Os4yEYf81h/OzOGhG6SHRFnkeaiSAiEAjxmd81w+EdoDmzCJrBrZBFklpK4K5rkb\n\
 sEkUiIkzAWo=\n\
 -----END CERTIFICATE-----\n";
+
+    /// Every URL of `servers` is a server of its own, and a bad one is named.
+    #[test]
+    fn every_url_of_the_list_is_a_server() {
+        let servers = [
+            "nats://n1:4222".to_owned(),
+            "tls://n2:4223".to_owned(),
+            " nats://n3:4224 ".to_owned(),
+        ];
+        let addrs = server_addrs(&servers).expect("three servers");
+        let hosts: Vec<(String, u16)> = addrs
+            .iter()
+            .map(|addr| (addr.host().to_owned(), addr.port()))
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                ("n1".to_owned(), 4222),
+                ("n2".to_owned(), 4223),
+                ("n3".to_owned(), 4224),
+            ]
+        );
+        let error =
+            server_addrs(&["nats://n1:4222".to_owned(), "nats://n2:port".to_owned()]).unwrap_err();
+        assert!(error.contains("nats://n2:port"), "{error}");
+    }
 
     fn cfg_with(extra: serde_json::Value) -> ClusterNatsConfig {
         let mut base = serde_json::json!({

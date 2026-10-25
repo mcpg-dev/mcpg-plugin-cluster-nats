@@ -159,6 +159,19 @@ pub struct JetStreamConfig {
     /// and subscriptions in `{state_bucket}-events`). Default 256 MiB.
     #[serde(default = "default_named_bucket_max_bytes")]
     pub named_bucket_max_bytes: u64,
+
+    /// Byte cap of `state_bucket`. Default 256 MiB. A bucket that exists
+    /// with a smaller cap is raised to it at connect; a cap is never
+    /// lowered. A full bucket refuses every write, so size it for the
+    /// live state (`mcpg_cluster_kv_bucket_bytes`).
+    #[serde(default = "default_state_bucket_max_bytes")]
+    pub state_bucket_max_bytes: u64,
+
+    /// Seconds between two sweeps that remove expired records and delete
+    /// markers from the state buckets. One replica sweeps at a time (a
+    /// lease). Default 60; `0` turns sweeping off.
+    #[serde(default = "default_sweep_interval_sec")]
+    pub sweep_interval_sec: u64,
 }
 
 /// JetStream KV storage backend selector.
@@ -183,6 +196,8 @@ impl Default for JetStreamConfig {
             replicas: default_replicas(),
             storage: default_storage(),
             named_bucket_max_bytes: default_named_bucket_max_bytes(),
+            state_bucket_max_bytes: default_state_bucket_max_bytes(),
+            sweep_interval_sec: default_sweep_interval_sec(),
         }
     }
 }
@@ -275,6 +290,14 @@ fn default_state_bucket() -> String {
 }
 fn default_named_bucket_max_bytes() -> u64 {
     256 * 1024 * 1024
+}
+fn default_state_bucket_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+/// The smallest `jetstream.state_bucket_max_bytes`.
+const MIN_STATE_BUCKET_MAX_BYTES: u64 = 1024 * 1024;
+fn default_sweep_interval_sec() -> u64 {
+    60
 }
 fn default_replicas() -> u32 {
     1
@@ -418,6 +441,11 @@ impl ClusterNatsConfig {
             if name.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!("`{label}` must not be empty")));
             }
+        }
+        if self.jetstream.state_bucket_max_bytes < MIN_STATE_BUCKET_MAX_BYTES {
+            return Err(ConfigError::Invalid(format!(
+                "`jetstream.state_bucket_max_bytes` must be at least {MIN_STATE_BUCKET_MAX_BYTES} (1 MiB)"
+            )));
         }
         if self.connection.connect_timeout_ms == 0 || self.connection.operation_timeout_ms == 0 {
             return Err(ConfigError::Invalid(

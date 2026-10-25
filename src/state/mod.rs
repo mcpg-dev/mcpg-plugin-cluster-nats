@@ -9,8 +9,9 @@
 //!   a revision-CAS-loop atomic `incr`
 //! - [`NatsTopicBus`] — `PubSub` over Core NATS subjects
 
+mod index;
 mod kv;
 mod topic;
 
-pub use kv::NatsKv;
+pub use kv::{BucketUsage, NatsKv, SweepReport};
 pub use topic::NatsTopicBus;

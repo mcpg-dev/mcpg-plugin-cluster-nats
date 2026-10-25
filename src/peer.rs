@@ -64,6 +64,11 @@ struct HeartbeatPayload {
     /// as one more heartbeat.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     leaving: bool,
+    /// The node writes the key index of the state buckets. A node that
+    /// predates the field sends none, and while one is alive no listing
+    /// trusts the index.
+    #[serde(default)]
+    kv_index: bool,
 }
 
 /// Bound on publishing the leaving heartbeat at shutdown.
@@ -79,9 +84,16 @@ pub(crate) struct PeerEntry {
     pub(crate) last_seen: Instant,
     pub(crate) last_seen_rfc3339: String,
     pub(crate) health: PeerHealth,
+    /// The peer writes the key index (see [`HeartbeatPayload`]).
+    pub(crate) kv_index: bool,
 }
 
 pub(crate) type PeerCache = Arc<RwLock<HashMap<String, PeerEntry>>>;
+
+/// True while a peer that does not write the key index is alive.
+pub(crate) async fn unindexed_peer_present(cache: &PeerCache) -> bool {
+    cache.read().await.values().any(|peer| !peer.kv_index)
+}
 
 /// Composite handle held on the plugin struct. Drop aborts both
 /// the heartbeat publisher and the subscriber tasks.
@@ -152,6 +164,7 @@ impl PeerWorkers {
             address,
             started_at: started_at_rfc3339,
             leaving: false,
+            kv_index: true,
         };
         let publisher = rt.spawn(publisher_loop(
             nats.clone(),
@@ -284,8 +297,8 @@ async fn subscriber_loop(
                     continue;
                 }
                 // Parse the payload only for the advisory `address` (self-reported)
-                // and the leaving flag.
-                let address = match serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
+                // and the leaving and key-index flags.
+                let (address, kv_index) = match serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
                     Ok(p) if p.leaving => {
                         if cache.write().await.remove(&node_id).is_some() {
                             let _ = events.send(PeerEvent::Left { node_id });
@@ -300,7 +313,7 @@ async fn subscriber_loop(
                                 "nats cluster: heartbeat node_id mismatch; trusting subject token"
                             );
                         }
-                        p.address
+                        (p.address, p.kv_index)
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -317,6 +330,7 @@ async fn subscriber_loop(
                     last_seen: Instant::now(),
                     last_seen_rfc3339: now_rfc3339(),
                     health: PeerHealth::Healthy,
+                    kv_index,
                 };
                 let mut guard = cache.write().await;
                 // Detect Joined vs HealthChanged before inserting so the

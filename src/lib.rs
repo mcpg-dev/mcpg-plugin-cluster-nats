@@ -28,6 +28,7 @@ mod lease;
 mod peer;
 mod pubsub;
 mod state;
+mod sweep;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +49,7 @@ use mcpg_plugin_sdk::ffi::{SyncClusterBackend, WatchHandleBox};
 use crate::state::{NatsKv, NatsTopicBus};
 
 pub use lease::NatsJetStreamLeaseHandle;
+pub use state::{BucketUsage, SweepReport};
 
 pub use config::{
     AuthConfig, ClusterNatsConfig, ConnectionConfig, JetStreamConfig, LeaseConfig, NodeConfig,
@@ -73,6 +75,9 @@ struct NatsJetStreamInner {
     peer_events: pubsub::PeerEventSender,
     /// Plugin start timestamp (RFC3339).
     started_at_rfc3339: String,
+    /// The host this instance reports metrics to; `None` when built
+    /// outside a host (tests, the manifest probe).
+    host: Option<mcpg_plugin_sdk::HostHandle>,
     /// NATS connection + peer workers + primitive bundle, established
     /// LAZILY on first real use. `make` does NOT connect — a
     /// broker-down-at-boot is tolerated and the empty-config manifest
@@ -108,6 +113,10 @@ struct Connected {
     /// so the cluster plugin presents one connection to NATS for the
     /// whole gateway.
     primitives: NatsPrimitives,
+    /// Reports the state buckets' fill, keeps their key index, and
+    /// removes expired records and delete markers from them unless
+    /// `jetstream.sweep_interval_sec` is 0.
+    _sweeper: sweep::KvSweeper,
 }
 
 /// Primitive impls sharing the cluster plugin's NATS connection.
@@ -117,7 +126,7 @@ struct NatsPrimitives {
     kv: Arc<NatsKv>,
     pub_sub: Arc<NatsTopicBus>,
     /// The buckets capabilities asked for by name, opened on first use.
-    named: tokio::sync::Mutex<std::collections::HashMap<String, Arc<NatsKv>>>,
+    named: sweep::NamedBuckets,
 }
 
 impl Connected {
@@ -130,7 +139,12 @@ impl Connected {
         if let Some(kv) = named.get(name) {
             return Ok(Arc::clone(kv));
         }
-        let kv = Arc::new(NatsKv::with_store(self.client.named_bucket(name).await?));
+        let kv = Arc::new(NatsKv::new(
+            self.client.named_bucket(name).await?,
+            self.client.nats.clone(),
+            self.client.js.clone(),
+            &self.client.api_prefix,
+        ));
         named.insert(name.to_owned(), Arc::clone(&kv));
         Ok(kv)
     }
@@ -182,12 +196,13 @@ impl KeyValueStore for NamedKv {
     async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
         self.kv().await?.delete(key).await
     }
-    async fn list_prefix(
+    async fn list_page(
         &self,
         prefix: &str,
+        cursor: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(String, mcpg_cluster_api::Entry)>, ClusterError> {
-        self.kv().await?.list_prefix(prefix, limit).await
+    ) -> Result<mcpg_cluster_api::KvPage, ClusterError> {
+        self.kv().await?.list_page(prefix, cursor, limit).await
     }
     async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError> {
         self.kv().await?.expire(key, ttl).await
@@ -204,6 +219,14 @@ impl KeyValueStore for NamedKv {
 
 impl NatsJetStreamCoordinator {
     pub fn from_config_json(config_json: &str) -> Self {
+        Self::from_config_json_with_host(config_json, None)
+    }
+
+    /// [`Self::from_config_json`], reporting metrics to `host`.
+    pub fn from_config_json_with_host(
+        config_json: &str,
+        host: Option<mcpg_plugin_sdk::HostHandle>,
+    ) -> Self {
         // Load-time manifest derivation builds + drops an instance only to
         // read its plugin-wide manifest. It has no real connection config, so
         // the host passes the manifest-probe sentinel (`{}`). Substitute a
@@ -216,7 +239,7 @@ impl NatsJetStreamCoordinator {
                 "{\"servers\":[\"nats://127.0.0.1:4222\"],\"node\":{\"id\":\"manifest-probe\"}}",
             )
             .expect("manifest-probe placeholder nats config is valid");
-            return Self::from_validated_config(cfg);
+            return Self::from_validated_config(cfg, None);
         }
         let config = ClusterNatsConfig::parse(config_json).unwrap_or_else(|err| {
             tracing::error!(
@@ -226,10 +249,78 @@ impl NatsJetStreamCoordinator {
             );
             panic!("nats cluster config parse failed: {err}")
         });
-        Self::from_validated_config(config)
+        Self::from_validated_config(config, host)
     }
 
-    fn from_validated_config(config: ClusterNatsConfig) -> Self {
+    /// Sweep every state bucket this instance opened now, whether or not
+    /// it holds the sweep lease, removing delete markers older than
+    /// `marker_grace`. Returns each bucket's report.
+    pub fn sweep_state_buckets(
+        &self,
+        marker_grace: Duration,
+    ) -> Result<Vec<(String, SweepReport)>, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner.runtime.block_on(async {
+            let mut buckets = vec![Arc::clone(&connected.primitives.kv)];
+            buckets.extend(connected.primitives.named.lock().await.values().cloned());
+            let mut reports = Vec::with_capacity(buckets.len());
+            for kv in buckets {
+                reports.push((kv.bucket().to_owned(), kv.sweep(marker_grace).await?));
+            }
+            Ok(reports)
+        })
+    }
+
+    /// Index every live key of each state bucket this instance opened and
+    /// let its listings read the index, as the sweep lease holder does once
+    /// no peer without the index is alive. Refused while one is. Returns
+    /// the keys indexed per bucket.
+    pub fn complete_key_index(&self) -> Result<Vec<(String, u64)>, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner.runtime.block_on(async {
+            if peer::unindexed_peer_present(&connected.peers.cache).await {
+                return Err(ClusterError::Precondition {
+                    reason: "a peer that does not write the key index is alive".into(),
+                });
+            }
+            let mut buckets = vec![Arc::clone(&connected.primitives.kv)];
+            buckets.extend(connected.primitives.named.lock().await.values().cloned());
+            let mut indexed = Vec::with_capacity(buckets.len());
+            for kv in buckets {
+                let started_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                let count = kv.backfill_index().await?;
+                kv.mark_index_complete(started_at_ms).await?;
+                kv.set_index_ready(true);
+                indexed.push((kv.bucket().to_owned(), count));
+            }
+            Ok(indexed)
+        })
+    }
+
+    /// Whether listings of the state bucket named `bucket` (or the shared
+    /// one) read the key index now.
+    pub fn key_index_ready(&self, bucket: Option<&str>) -> Result<bool, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner
+            .runtime
+            .block_on(async move { Ok(connected.kv(bucket).await?.index_ready()) })
+    }
+
+    /// What the state bucket named `bucket` (or the shared one) holds now.
+    pub fn bucket_usage(&self, bucket: Option<&str>) -> Result<BucketUsage, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner
+            .runtime
+            .block_on(async move { connected.kv(bucket).await?.usage().await })
+    }
+
+    fn from_validated_config(
+        config: ClusterNatsConfig,
+        host: Option<mcpg_plugin_sdk::HostHandle>,
+    ) -> Self {
         // Multi-thread runtime: one worker for the heartbeat
         // publisher, one for the subscriber + sweeper, with
         // headroom for the lease-renewal and pub/sub worker
@@ -277,6 +368,7 @@ impl NatsJetStreamCoordinator {
             config,
             peer_events,
             started_at_rfc3339,
+            host,
             connected: OnceCell::new(),
             runtime,
         });
@@ -347,15 +439,42 @@ async fn get_or_init_connected(
             // coordinator holds. The `KeyValueStore` primitive points at
             // `state_bucket`; `PubSub` shares the connected `Client`.
             let primitives = NatsPrimitives {
-                kv: Arc::new(NatsKv::with_store(client.state.clone())),
+                kv: Arc::new(NatsKv::new(
+                    client.state.clone(),
+                    client.nats.clone(),
+                    client.js.clone(),
+                    &client.api_prefix,
+                )),
                 pub_sub: Arc::new(NatsTopicBus::with_client(client.nats.clone())),
-                named: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                named: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             };
+
+            let sweep_interval_sec = inner.config.jetstream.sweep_interval_sec;
+            let sweeper = sweep::KvSweeper::start(
+                inner.runtime.handle(),
+                sweep::SweepParams {
+                    leases: client.leases.clone(),
+                    fencing: client.fencing.clone(),
+                    node_id: inner.config.node.id.clone(),
+                    interval: Duration::from_secs(if sweep_interval_sec > 0 {
+                        sweep_interval_sec
+                    } else {
+                        sweep::IDLE_INTERVAL_SEC
+                    }),
+                    sweep: sweep_interval_sec > 0,
+                    state: Arc::clone(&primitives.kv),
+                    named: Arc::clone(&primitives.named),
+                    host: inner.host.clone(),
+                    peers: Arc::clone(&peers.cache),
+                    peer_expiry: Duration::from_secs(inner.config.node.peer_expiry_sec),
+                },
+            );
 
             Ok::<Connected, ClusterError>(Connected {
                 client,
                 peers,
                 primitives,
+                _sweeper: sweeper,
             })
         })
         .await
@@ -844,12 +963,13 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
         self.kv_delete_in(None, key)
     }
 
-    fn kv_list_prefix(
+    fn kv_list_page(
         &self,
         prefix: &str,
+        cursor: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(String, mcpg_cluster_api::Entry)>, ClusterError> {
-        self.kv_list_prefix_in(None, prefix, limit)
+    ) -> Result<mcpg_cluster_api::KvPage, ClusterError> {
+        self.kv_list_page_in(None, prefix, cursor, limit)
     }
 
     fn kv_expire(&self, key: &str, ttl_ms: Option<u64>) -> Result<bool, ClusterError> {
@@ -912,16 +1032,21 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
             .block_on(async move { connected.kv(bucket).await?.delete(key).await })
     }
 
-    fn kv_list_prefix_in(
+    fn kv_list_page_in(
         &self,
         bucket: Option<&str>,
         prefix: &str,
+        cursor: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(String, mcpg_cluster_api::Entry)>, ClusterError> {
+    ) -> Result<mcpg_cluster_api::KvPage, ClusterError> {
         let connected = self.require_connected()?;
-        self.inner
-            .runtime
-            .block_on(async move { connected.kv(bucket).await?.list_prefix(prefix, limit).await })
+        self.inner.runtime.block_on(async move {
+            connected
+                .kv(bucket)
+                .await?
+                .list_page(prefix, cursor, limit)
+                .await
+        })
     }
 
     fn kv_expire_in(
@@ -972,7 +1097,7 @@ declare_plugin! {
         cluster_backend as cluster {
             inner_name: "",
             plugin_type: NatsJetStreamCoordinator,
-            factory: |cfg: &str, _host: ::mcpg_plugin_sdk::HostHandle| NatsJetStreamCoordinator::from_config_json(cfg),
+            factory: |cfg: &str, host: ::mcpg_plugin_sdk::HostHandle| NatsJetStreamCoordinator::from_config_json_with_host(cfg, Some(host)),
         }
     ],
 }

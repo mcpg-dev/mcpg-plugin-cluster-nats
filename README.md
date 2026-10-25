@@ -37,7 +37,32 @@ the messaging system you already operate.
   streamed to watchers.
 - Escapes gateway key names into the JetStream KV alphabet with a
   prefix-preserving encoding, so prefix listing still works for keys containing
-  characters JetStream KV would reject.
+  characters JetStream KV would reject. Listings page by stream sequence.
+- Lists by prefix at the cost of the matching keys, not of the bucket: next to
+  each data record the bucket holds an index record (`=I.` keys) whose subject
+  splits the key at each `:`, `/` and `.`, so the server filters a listing by
+  its prefix. A write that creates a key writes the index record after the
+  data record; a delete or a sweep removes it and writes it back when a
+  concurrent write won. Listings read the index only while every live peer
+  writes it (the heartbeat carries `kv_index: true`) and a backfill marked it
+  complete; during a rolling upgrade from an older build they scan every
+  record as before, and the sweep lease holder completes the index once no
+  older peer has been seen for `node.peer_expiry_sec`.
+- Keeps the state buckets bounded. JetStream removes nothing on its own (the
+  buckets have no `max_age`, since a key without a TTL must live), so every
+  write carries its expiry in an `Mcpg-Expires` header, and one replica at a
+  time — the holder of the `mcpg-kv-sweep.<state bucket>` lease — sweeps every
+  `jetstream.sweep_interval_sec`: expired values and delete markers older than
+  a minute are purged, each up to the sequence the sweep read, so a write made
+  during the sweep survives. A record from an older build (no header) is read
+  once and then removed or given the header. An expired key counts as absent
+  everywhere, also before the sweep: a claim takes it over by a CAS on its
+  revision.
+- Reports each bucket's fill as `mcpg_cluster_kv_bucket_bytes`,
+  `mcpg_cluster_kv_bucket_messages` and `mcpg_cluster_kv_bucket_max_bytes`
+  (label `bucket`), counts removals in `mcpg_cluster_kv_swept_total` (labels
+  `bucket`, `reason`), and warns while a bucket is above 80 % of its cap. A
+  full bucket refuses every write (`discard: new`).
 - Connects lazily: the plugin registers without touching the broker, and a NATS
   outage at boot degrades individual operations rather than preventing startup.
 - Declares the `network_outbound` capability; the gateway refuses to load the
@@ -102,6 +127,9 @@ plugins:
 | `jetstream.replicas` | integer | `1` | Replication factor for the KV buckets the plugin creates. Must be greater than zero; use `3` on a real NATS cluster. |
 | `jetstream.storage` | `file` \| `memory` | `file` | `file` survives NATS restarts; `memory` is lighter but loses lease and capability state on any restart. |
 | `jetstream.domain` | string | unset | JetStream domain, for leaf-node deployments. |
+| `jetstream.state_bucket_max_bytes` | integer | `268435456` (256 MiB) | Byte cap of `state_bucket`, at least 1 MiB. An existing bucket with a smaller cap is raised at connect; a cap is never lowered. A full bucket refuses every write, so size it for the live state. |
+| `jetstream.named_bucket_max_bytes` | integer | `268435456` (256 MiB) | Byte cap of each bucket a capability asks for by name (`{state_bucket}-{name}`, such as `mcpg-state-events`); raised at connect like the state bucket's. |
+| `jetstream.sweep_interval_sec` | integer | `60` | Seconds between sweeps of the state buckets; `0` turns sweeping off. |
 | `lease.default_ttl_sec` | integer | `30` | TTL used when the caller does not supply one. Must be greater than zero. |
 | `lease.renew_before_expiry_percent` | integer | `50` | What share of the TTL must still remain when renewal fires; the renewal task sleeps through the rest of the TTL first. Must be within `1..=99`. |
 | `connection.connect_timeout_ms` | integer | `5000` | Connect deadline, in milliseconds. Must be greater than zero. |
@@ -119,6 +147,8 @@ write subject and bucket permissions for the gateway's NATS user:
 | KV bucket | `jetstream.leases_bucket` | Lease and lock records. |
 | KV bucket | `jetstream.fencing_bucket` | Per-key fencing counters. |
 | KV bucket | `jetstream.state_bucket` | Capability state inherited from the coordinator. |
+| JetStream API | `STREAM.PURGE.KV_<state bucket>` (and of each named bucket) | The sweep removes expired records and delete markers. Without it, they stay until the bucket is full. |
+| JetStream API | `STREAM.INFO.KV_<bucket>`, `STREAM.UPDATE.KV_<bucket>` | Fill gauges, and raising a bucket's byte cap at connect. |
 | Subject | `mcpg.notify.<topic>.<routing key>` | Pub/sub. Always four tokens; an unfiltered subscriber matches the last one with `*`. |
 | Subject | `mcpg.peers.heartbeat.<node id>` | Peer presence; the subscriber watches `mcpg.peers.heartbeat.*`. |
 
