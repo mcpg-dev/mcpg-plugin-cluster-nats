@@ -216,6 +216,15 @@ impl KeyValueStore for NamedKv {
     ) -> Result<i64, ClusterError> {
         self.kv().await?.incr(key, delta, ttl).await
     }
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.kv().await?.incr_floor(key, delta, floor, ttl).await
+    }
 }
 
 impl NatsJetStreamCoordinator {
@@ -981,6 +990,20 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
         self.kv_incr_in(None, key, delta, ttl_ms)
     }
 
+    fn declares_kv_incr_floor(&self) -> bool {
+        true
+    }
+
+    fn kv_incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl_ms: Option<u64>,
+    ) -> Result<i64, ClusterError> {
+        self.kv_incr_floor_in(None, key, delta, floor, ttl_ms)
+    }
+
     fn kv_get_in(
         &self,
         bucket: Option<&str>,
@@ -1079,6 +1102,24 @@ impl SyncClusterBackend for NatsJetStreamCoordinator {
                 .kv(bucket)
                 .await?
                 .incr(key, delta, ttl_from_ms(ttl_ms))
+                .await
+        })
+    }
+
+    fn kv_incr_floor_in(
+        &self,
+        bucket: Option<&str>,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl_ms: Option<u64>,
+    ) -> Result<i64, ClusterError> {
+        let connected = self.require_connected()?;
+        self.inner.runtime.block_on(async move {
+            connected
+                .kv(bucket)
+                .await?
+                .incr_floor(key, delta, floor, ttl_from_ms(ttl_ms))
                 .await
         })
     }

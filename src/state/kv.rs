@@ -1269,6 +1269,37 @@ impl KeyValueStore for NatsKv {
         delta: i64,
         ttl: Option<Duration>,
     ) -> Result<i64, ClusterError> {
+        self.update_counter("incr", key, ttl, |current| {
+            current
+                .checked_add(delta)
+                .ok_or_else(mcpg_cluster_api::counter_overflow)
+        })
+        .await
+    }
+
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.update_counter("incr_floor", key, ttl, |current| {
+            mcpg_cluster_api::floor_add(current, floor, delta)
+        })
+        .await
+    }
+}
+
+impl NatsKv {
+    /// Store `step(current)` as the counter under `key` and return it.
+    async fn update_counter(
+        &self,
+        op: &str,
+        key: &str,
+        ttl: Option<Duration>,
+        step: impl Fn(i64) -> Result<i64, ClusterError>,
+    ) -> Result<i64, ClusterError> {
         // Atomicity rides the bucket's per-key revision: read the record,
         // compute the new count, then write it expecting what was read
         // (nothing, a dead record's revision, or the live one's) — an
@@ -1306,9 +1337,12 @@ impl KeyValueStore for NatsKv {
                     )
                 }
             };
-            let next = current
-                .checked_add(delta)
-                .ok_or_else(mcpg_cluster_api::counter_overflow)?;
+            let next = step(current)?;
+            // A live counter that the step leaves as it is needs no write, so
+            // a read through `incr` by zero takes no part in the CAS race.
+            if next == current && !creates && ttl.is_none() {
+                return Ok(next);
+            }
             let write = self
                 .publish(
                     &encoded,
@@ -1342,7 +1376,7 @@ impl KeyValueStore for NatsKv {
         }
         Err(ClusterError::CasConflict {
             key: key.to_owned(),
-            reason: format!("nats kv incr: revision CAS lost {CAS_ATTEMPTS} rounds"),
+            reason: format!("nats kv {op}: revision CAS lost {CAS_ATTEMPTS} rounds"),
         })
     }
 }
