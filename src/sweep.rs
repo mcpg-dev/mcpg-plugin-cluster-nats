@@ -38,6 +38,11 @@ const SWEEP_LEASE_KEY: &str = "mcpg-kv-sweep";
 /// the lease first.
 const FIRST_SWEEP_DELAY: Duration = Duration::from_secs(10);
 
+/// How often, between sweeps, a replica whose listings do not read a
+/// bucket's index yet looks whether the sweep lease holder completed it.
+/// Until it does, each of its listings scans every record of the bucket.
+const INDEX_GATE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Share of a bucket's byte cap above which every report warns.
 const FULL_WARN_RATIO: f64 = 0.8;
 
@@ -93,18 +98,39 @@ async fn run(runtime: Handle, p: SweepParams) {
     tokio::time::sleep(FIRST_SWEEP_DELAY.min(p.interval)).await;
     let mut tick = tokio::time::interval(p.interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut gate = tokio::time::interval(INDEX_GATE_INTERVAL);
+    gate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut lease: Option<NatsJetStreamLeaseHandle> = None;
     let mut full: HashMap<String, bool> = HashMap::new();
     // When this replica last saw a peer that does not write the index.
     let mut unindexed_seen: Option<std::time::Instant> = None;
     loop {
-        tick.tick().await;
+        let sweep_tick = tokio::select! {
+            biased;
+            _ = tick.tick() => true,
+            _ = gate.tick() => false,
+        };
         let buckets: Vec<Arc<NatsKv>> = {
             let named = p.named.lock().await;
             std::iter::once(Arc::clone(&p.state))
                 .chain(named.values().cloned())
                 .collect()
         };
+        if !sweep_tick {
+            if buckets.iter().all(|kv| kv.index_ready()) {
+                continue;
+            }
+            // No index is read while such a peer lives; the sweep tick
+            // takes it back.
+            if peer::unindexed_peer_present(&p.peers).await {
+                unindexed_seen = Some(std::time::Instant::now());
+                continue;
+            }
+            for kv in buckets.iter().filter(|kv| !kv.index_ready()) {
+                gate_index(kv, false).await;
+            }
+            continue;
+        }
         for kv in &buckets {
             match kv.usage().await {
                 Ok(usage) => report_usage(kv.bucket(), usage, p.host.as_ref(), &mut full),

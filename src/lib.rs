@@ -146,8 +146,17 @@ impl Connected {
             self.client.js.clone(),
             &self.client.api_prefix,
         ));
+        complete_index_if_empty(&kv).await;
         named.insert(name.to_owned(), Arc::clone(&kv));
         Ok(kv)
+    }
+}
+
+/// A bucket opened with no record needs no backfill before its listings
+/// read the index; when its state cannot be read, the sweep completes it.
+async fn complete_index_if_empty(kv: &NatsKv) {
+    if let Err(error) = kv.complete_index_if_empty().await {
+        tracing::debug!(bucket = kv.bucket(), error = %error, "nats cluster: index state of an empty bucket unavailable; the sweep completes it");
     }
 }
 
@@ -458,6 +467,7 @@ async fn get_or_init_connected(
                 pub_sub: Arc::new(NatsTopicBus::with_client(client.nats.clone())),
                 named: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             };
+            complete_index_if_empty(&primitives.kv).await;
 
             let sweep_interval_sec = inner.config.jetstream.sweep_interval_sec;
             let sweeper = sweep::KvSweeper::start(

@@ -496,6 +496,21 @@ impl NatsKv {
         Ok(())
     }
 
+    /// Mark the index of a bucket that holds no record complete: no key
+    /// needs a backfill, and every key this build writes comes with its
+    /// index record. Listings read it once the sweep task's index gate sees
+    /// it with no peer without the index alive.
+    pub async fn complete_index_if_empty(&self) -> Result<(), ClusterError> {
+        if self.usage().await?.messages == 0 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            self.mark_index_complete(now_ms).await?;
+        }
+        Ok(())
+    }
+
     /// An ordered, headers-only consumer over the keys of the bucket that
     /// match `filter` (a subject filter after the bucket's prefix), that
     /// the server delivers at most `rate_limit` bits a second (`0`: as fast
