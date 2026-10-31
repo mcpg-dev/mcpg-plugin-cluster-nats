@@ -152,6 +152,14 @@ write subject and bucket permissions for the gateway's NATS user:
 | Subject | `mcpg.notify.<topic>.<routing key>` | Pub/sub. Always four tokens; an unfiltered subscriber matches the last one with `*`. |
 | Subject | `mcpg.peers.heartbeat.<node id>` | Peer presence; the subscriber watches `mcpg.peers.heartbeat.*`. |
 
+The sweep removes each dead record with a purge filtered on its key's subject.
+nats-server 2.14 and later read only the blocks that hold that subject, and the
+sweep runs 32 removals at once. Before 2.14 such a purge reads every block of
+the stream on every replica, and the stream applies its writes in order behind
+it, so the sweep removes one record at a time, every write of the bucket waits
+behind each removal, and the plugin warns at connect. Use 2.14 or later with MCP
+Events, which leaves about two dead records per event.
+
 `_default_` is reserved as the routing-key token for a publish with no routing
 key, so that subscriber wildcards keep a constant subject arity. Passing it
 explicitly as a routing key is rejected.

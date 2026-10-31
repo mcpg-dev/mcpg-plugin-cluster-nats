@@ -468,6 +468,12 @@ async fn get_or_init_connected(
                 named: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             };
             complete_index_if_empty(&primitives.kv).await;
+            if primitives.kv.purge_reads_every_block() {
+                tracing::warn!(
+                    version = %client.nats.server_info().version,
+                    "nats cluster: this nats-server purges one key by reading every block of the bucket's stream (before 2.14), so the sweep removes dead records one at a time; a bucket with many short-lived keys (MCP Events) can outgrow it. Use nats-server 2.14 or later"
+                );
+            }
 
             let sweep_interval_sec = inner.config.jetstream.sweep_interval_sec;
             let sweeper = sweep::KvSweeper::start(

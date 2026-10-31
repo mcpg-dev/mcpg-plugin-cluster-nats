@@ -50,6 +50,23 @@ pub struct NatsKv {
     /// Listings read the index: every writer of the fleet writes it and a
     /// backfill completed it. Until then they scan every record.
     index_ready: AtomicBool,
+    /// The server purges one subject by reading every block of the stream
+    /// (before nats-server 2.14), see [`purge_reads_every_block`].
+    purge_reads_every_block: bool,
+}
+
+/// Whether nats-server `version` purges one subject by reading every block
+/// of the stream on every replica, which releases from 2.14 do not: they
+/// read only the blocks that hold the subject. An unreadable version counts
+/// as an old one.
+pub(crate) fn purge_reads_every_block(version: &str) -> bool {
+    let mut parts = version
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) < (2, 14),
+        _ => true,
+    }
 }
 
 impl NatsKv {
@@ -74,18 +91,26 @@ impl NatsKv {
         } else {
             subject_prefix
         };
+        let purge_reads_every_block = purge_reads_every_block(&client.server_info().version);
         Self {
             store,
             client,
             js,
             write_prefix,
             index_ready: AtomicBool::new(false),
+            purge_reads_every_block,
         }
     }
 
     /// The bucket's name.
     pub fn bucket(&self) -> &str {
         &self.store.name
+    }
+
+    /// Whether the connected server purges one subject by reading every
+    /// block of the stream.
+    pub fn purge_reads_every_block(&self) -> bool {
+        self.purge_reads_every_block
     }
 
     /// Let listings read the index, or make them scan every record.
@@ -667,6 +692,7 @@ impl NatsKv {
         };
         let now = now_unix_secs();
         let mut legacy: Vec<(String, u64)> = Vec::new();
+        let mut dead: Vec<(String, u64)> = Vec::new();
         loop {
             let record =
                 match tokio::time::timeout(LIST_IDLE_TIMEOUT, consumer.records.next()).await {
@@ -697,7 +723,7 @@ impl NatsKv {
                         .and_then(|v| v.as_str().parse::<u64>().ok());
                     match expiry {
                         Some(at) if at != 0 && at <= now => {
-                            self.remove_dead(subject, sequence).await?;
+                            dead.push((subject.to_owned(), sequence));
                             report.expired += 1;
                         }
                         Some(_) => {}
@@ -711,7 +737,7 @@ impl NatsKv {
                 }
                 Operation::Delete | Operation::Purge => {
                     if now.saturating_sub(published) >= marker_grace.as_secs() {
-                        self.remove_dead(subject, sequence).await?;
+                        dead.push((subject.to_owned(), sequence));
                         report.markers += 1;
                     }
                 }
@@ -722,6 +748,7 @@ impl NatsKv {
         }
 
         drop(consumer);
+        self.remove_all_dead(dead).await?;
         let outcomes: Vec<Result<LegacyOutcome, ClusterError>> = futures::stream::iter(legacy)
             .map(|(encoded, sequence)| async move { self.settle_legacy(&encoded, sequence).await })
             .buffer_unordered(LIST_FETCH_PARALLELISM)
@@ -735,6 +762,25 @@ impl NatsKv {
             }
         }
         Ok(report)
+    }
+
+    /// Remove the dead records a sweep read, [`LIST_FETCH_PARALLELISM`] at
+    /// once. Behind a purge that reads every block of the stream
+    /// (nats-server before 2.14) the stream applies its writes in order, so
+    /// there they go one at a time.
+    async fn remove_all_dead(&self, dead: Vec<(String, u64)>) -> Result<(), ClusterError> {
+        if self.purge_reads_every_block {
+            for (subject, sequence) in dead {
+                self.remove_dead(&subject, sequence).await?;
+            }
+            return Ok(());
+        }
+        futures::stream::iter(dead)
+            .map(|(subject, sequence)| async move { self.remove_dead(&subject, sequence).await })
+            .buffer_unordered(LIST_FETCH_PARALLELISM)
+            .try_collect::<Vec<()>>()
+            .await
+            .map(|_| ())
     }
 
     /// Remove the dead record at `sequence` of `subject` (an expired value
@@ -1399,6 +1445,16 @@ impl NatsKv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn servers_before_2_14_purge_by_reading_every_block() {
+        for old in ["2.10.24", "2.11.0", "2.13.3", "2.13.0-RC.1", "", "nats"] {
+            assert!(purge_reads_every_block(old), "{old:?}");
+        }
+        for new in ["2.14.0", "2.14.0-beta.2", "2.15.2", "3.0.0"] {
+            assert!(!purge_reads_every_block(new), "{new:?}");
+        }
+    }
 
     /// Mirror of async-nats' `is_valid_key` (it is crate-private): keys
     /// must be non-empty, not start/end with `.`, and contain only
