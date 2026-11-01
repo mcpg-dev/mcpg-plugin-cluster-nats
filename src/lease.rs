@@ -459,10 +459,9 @@ async fn renew_inner(inner: &LeaseInner) -> Result<String, ClusterError> {
     let renewed = match inner.leases.update(&inner.key, new_value, revision).await {
         Ok(_) => new_record,
         Err(e) => {
-            let s = e.to_string();
-            if !(s.contains("wrong last sequence") || s.contains("revision")) {
+            if !lost_cas(&e) {
                 return Err(ClusterError::BackendUnavailable {
-                    reason: format!("lease renew update: {s}"),
+                    reason: format!("lease renew update: {e}"),
                 });
             }
             // The renewal task and a host-driven renew of this same lease
@@ -566,7 +565,7 @@ async fn bump_fencing_token(fencing: &KvStore, key: &str) -> Result<u64, Cluster
             Ok(_) => return Ok(next),
             // Lost the CAS race; retry with the fresh sequence. Fencing
             // tokens MAY skip values — the trait only requires monotonicity.
-            Err(e) if e.kind() == UpdateErrorKind::WrongLastRevision => continue,
+            Err(e) if lost_cas(&e) => continue,
             Err(e) => {
                 return Err(ClusterError::BackendUnavailable {
                     reason: format!("fencing CAS: {e}"),
@@ -577,6 +576,11 @@ async fn bump_fencing_token(fencing: &KvStore, key: &str) -> Result<u64, Cluster
     Err(ClusterError::BackendUnavailable {
         reason: "fencing CAS exhausted retries".into(),
     })
+}
+
+/// A KV update that lost its compare-and-set, under either server code.
+fn lost_cas(e: &async_nats::jetstream::kv::UpdateError) -> bool {
+    e.kind() == UpdateErrorKind::WrongLastRevision || crate::error::is_wrong_last_sequence(e)
 }
 
 async fn try_create(
@@ -594,9 +598,7 @@ async fn try_create(
         // without `release` would otherwise wedge this slot forever.
         // Reclaim a released or EXPIRED lease via a CAS-replace; a live
         // one is genuinely Held.
-        Err(e) if e.kind() == UpdateErrorKind::WrongLastRevision => {
-            reclaim_if_expired(leases, key, record, value).await
-        }
+        Err(e) if lost_cas(&e) => reclaim_if_expired(leases, key, record, value).await,
         Err(e) => AcquireOutcome::BackendError(format!("kv create: {e}")),
     }
 }

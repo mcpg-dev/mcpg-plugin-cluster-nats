@@ -173,7 +173,12 @@ impl PendingWrite {
     async fn done(self) -> Result<u64, WriteError> {
         match self.0.await {
             Ok(ack) => Ok(ack.sequence),
-            Err(e) if e.kind() == PublishErrorKind::WrongLastSequence => Err(WriteError::Conflict),
+            Err(e)
+                if e.kind() == PublishErrorKind::WrongLastSequence
+                    || crate::error::is_wrong_last_sequence(&e) =>
+            {
+                Err(WriteError::Conflict)
+            }
             Err(e) => Err(WriteError::Failed(ClusterError::BackendUnavailable {
                 reason: format!("nats kv write: {e}"),
             })),
