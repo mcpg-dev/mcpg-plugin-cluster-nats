@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-cluster-nats"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.5"
 license = "BUSL-1.1"
 edition = "2024"
 description = "NATS JetStream cluster_backend plugin (dev.mcpg.cluster.nats)"
@@ -9,9 +9,9 @@ description = "NATS JetStream cluster_backend plugin (dev.mcpg.cluster.nats)"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-rc.1", version = "=0.1.0-rc.1" }
-mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-rc.1", version = "=0.1.0-rc.1" }
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-rc.1", version = "=0.1.0-rc.1" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-rc.3", version = "=0.1.0-rc.3" }
+mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-rc.3", version = "=0.1.0-rc.3" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-rc.5", version = "=0.1.0-rc.5" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
